@@ -1,3 +1,7 @@
+// Windows: build as a GUI binary so launching from Explorer or a shortcut does
+// not pop a console window. `--debug` opens one on demand (see `init_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
@@ -40,9 +44,62 @@ enum LanMouseError {
     Cli(#[from] CliError),
 }
 
+fn debug_requested() -> bool {
+    std::env::args().any(|a| a == "--debug")
+}
+
+/// Give a windows-subsystem process somewhere to write its stdio: the terminal
+/// it was launched from if there is one, a fresh console window when `--debug`
+/// asks for it, and `NUL` otherwise so log writes are discarded rather than
+/// failing against the null handles such a process starts with.
+#[cfg(windows)]
+fn init_console() {
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, GetConsoleWindow, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    use windows::core::w;
+
+    unsafe {
+        // The spawned daemon inherits the parent's console and handles already.
+        if !GetConsoleWindow().0.is_null() {
+            return;
+        }
+
+        let have_console = AttachConsole(ATTACH_PARENT_PROCESS).is_ok()
+            || (debug_requested() && AllocConsole().is_ok());
+
+        let target = if have_console {
+            w!("CONOUT$")
+        } else {
+            w!("NUL")
+        };
+        if let Ok(handle) = CreateFileW(
+            target,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ) {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    init_console();
+
     // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
+    let default_level = if debug_requested() { "debug" } else { "info" };
+    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", default_level);
     env_logger::init_from_env(env);
 
     if let Err(e) = run() {

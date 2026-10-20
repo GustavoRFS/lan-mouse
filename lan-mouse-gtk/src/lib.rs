@@ -9,6 +9,8 @@ mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
 mod window;
+#[cfg(windows)]
+mod windows_tray;
 
 use std::{env, process, str, sync::OnceLock};
 
@@ -329,7 +331,16 @@ fn build_ui(app: &Application) {
         }
     ));
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        window.connect_close_request(|window| {
+            window.set_visible(false);
+            glib::Propagation::Stop
+        });
+        windows_tray::setup(app, &window);
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     window.present();
 
     // On macOS, default to presenting the main window on every launch

@@ -113,6 +113,10 @@ struct Args {
     #[arg(long)]
     cert_path: Option<PathBuf>,
 
+    /// open a console window with debug logging (Windows)
+    #[arg(long)]
+    debug: bool,
+
     /// subcommands
     #[command(subcommand)]
     command: Option<Command>,

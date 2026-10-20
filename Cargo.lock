@@ -1775,6 +1775,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "webrtc-dtls",
  "webrtc-util",
+ "windows",
 ]
 
 [[package]]
@@ -1800,6 +1801,7 @@ dependencies = [
  "libadwaita",
  "log",
  "thiserror 2.0.18",
+ "windows",
 ]
 
 [[package]]
