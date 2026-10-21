@@ -169,6 +169,14 @@ impl ClipboardSync {
             if fs::write(&path, &file.contents).is_err() {
                 return;
             }
+            // mark files from the network as internet zone so the shell
+            // applies the same checks as for downloads (Mark-of-the-Web)
+            #[cfg(windows)]
+            {
+                let mut zone = path.clone().into_os_string();
+                zone.push(":Zone.Identifier");
+                let _ = fs::write(zone, "[ZoneTransfer]\r\nZoneId=3\r\n");
+            }
             file.name = name;
             local_files.push(gio::File::for_path(path));
         }
