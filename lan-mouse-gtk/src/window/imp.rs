@@ -4,7 +4,7 @@ use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
 use glib::subclass::InitializingObject;
 use gtk::glib::clone;
-use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, glib};
+use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, gdk, gio, glib};
 
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
@@ -44,6 +44,8 @@ pub struct Window {
     #[template_child]
     pub input_capture_button: TemplateChild<Button>,
     #[template_child]
+    pub clipboard_sharing_switch: TemplateChild<Switch>,
+    #[template_child]
     pub authorized_list: TemplateChild<ListBox>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
@@ -51,6 +53,7 @@ pub struct Window {
     pub port: Cell<u16>,
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
+    pub clipboard_sharing: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
 }
 
@@ -197,6 +200,18 @@ impl ObjectImpl for Window {
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);
         let obj = self.obj();
+        self.clipboard_sharing
+            .set(self.clipboard_sharing_switch.is_active());
+        let window_weak = obj.downgrade();
+        self.clipboard_sharing_switch
+            .connect_active_notify(move |switch| {
+                if let Some(window) = window_weak.upgrade() {
+                    let enabled = switch.is_active();
+                    if window.imp().clipboard_sharing.replace(enabled) != enabled {
+                        window.request_clipboard_sharing(enabled);
+                    }
+                }
+            });
         obj.setup_icon();
         obj.setup_clients();
         obj.setup_authorized();

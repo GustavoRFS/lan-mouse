@@ -315,7 +315,20 @@ the gtk frontend (see conditional compilation).
 <details>
     <summary>Gtk Frontend</summary>
 
-By default the gtk frontend will open when running `lan-mouse`.
+On Linux, the GTK frontend starts in the system tray when the desktop provides a
+StatusNotifierItem host. Activate the tray icon to open the window; closing the
+window hides it, and the tray menu's `Quit Lan Mouse` action exits the app. If
+the desktop has no tray host, the window opens normally so Lan Mouse remains
+accessible.
+
+On Windows the frontend starts minimized to the tray, where its context menu
+provides `Open Lan Mouse` and `Quit`. On macOS the frontend opens normally and
+remains available from the menu bar item.
+
+Clipboard sharing is enabled by default and can be paused from the General
+section. The first stage synchronizes plain text up to 256 KiB between directly
+connected devices on Windows and Linux. Image and file clipboard transfer are
+planned follow-up stages.
 
 To connect a device you want to control, simply click the `Add` button and enter the hostname
 of the device.
@@ -439,7 +452,9 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] Clipboard text sharing (Windows and Linux)
+- [ ] Clipboard image sharing
+- [ ] Clipboard file sharing
 
 
 ## Detailed OS Support

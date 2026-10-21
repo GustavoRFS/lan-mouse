@@ -1,4 +1,5 @@
 mod capture;
+mod clipboard;
 pub mod capture_test;
 pub mod client;
 pub mod config;

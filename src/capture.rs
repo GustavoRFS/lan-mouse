@@ -9,12 +9,12 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
+use lan_mouse_proto::{ClipboardUpdateId, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{LanMouseConnection, NetworkEvent};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -44,6 +44,10 @@ pub(crate) enum ICaptureEvent {
     /// remote `Leave`, explicit `Release` request, send
     /// failure, or destroy of the active capture).
     ClientLeft(u64),
+    ClipboardText {
+        update_id: ClipboardUpdateId,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +72,11 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    ClipboardText {
+        update_id: ClipboardUpdateId,
+        text: String,
+    },
+    CancelClipboardTransfers,
 }
 
 impl Capture {
@@ -143,6 +152,22 @@ impl Capture {
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+    }
+
+    pub(crate) fn broadcast_clipboard_text(
+        &self,
+        update_id: ClipboardUpdateId,
+        text: String,
+    ) {
+        self.request_tx
+            .send(CaptureRequest::ClipboardText { update_id, text })
+            .expect("channel closed");
+    }
+
+    pub(crate) fn cancel_clipboard_transfers(&self) {
+        self.request_tx
+            .send(CaptureRequest::CancelClipboardTransfers)
+            .expect("channel closed");
     }
 }
 
@@ -221,7 +246,20 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::ClipboardText { update_id, text } => {
+                            self.conn.broadcast_clipboard_text(update_id, text).await;
+                        }
+                        CaptureRequest::CancelClipboardTransfers => {
+                            self.conn.cancel_clipboard_transfers().await;
+                        }
                     },
+                    (handle, event) = self.conn.recv() => {
+                        if let NetworkEvent::ClipboardText { update_id, text } = event {
+                            self.event_tx.send(ICaptureEvent::ClipboardText { update_id, text }).expect("channel closed");
+                        } else {
+                            log::trace!("ignoring non-clipboard network event from {handle} while input capture is unavailable");
+                        }
+                    }
                     _ = self.cancellation_token.cancelled() => return,
                 }
             }
@@ -278,6 +316,13 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
+                    let event = match event {
+                        NetworkEvent::ClipboardText { update_id, text } => {
+                            self.event_tx.send(ICaptureEvent::ClipboardText { update_id, text }).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::Proto(event) => event,
+                    };
                     if let Some(active) = self.active_client {
                         if handle != active {
                             // we only care about events coming from the client we are currently connected to
@@ -323,6 +368,12 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
+                    }
+                    CaptureRequest::ClipboardText { update_id, text } => {
+                        self.conn.broadcast_clipboard_text(update_id, text).await;
+                    }
+                    CaptureRequest::CancelClipboardTransfers => {
+                        self.conn.cancel_clipboard_transfers().await;
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

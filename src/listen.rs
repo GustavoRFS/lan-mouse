@@ -1,5 +1,7 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{
+    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
@@ -22,7 +24,10 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::crypto;
+use crate::{
+    clipboard::{ClipboardPeer, SharedClipboardReassembler},
+    crypto,
+};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -39,6 +44,11 @@ pub(crate) enum ListenEvent {
         event: ProtoEvent,
         addr: SocketAddr,
     },
+    ClipboardText {
+        update_id: ClipboardUpdateId,
+        text: String,
+        addr: SocketAddr,
+    },
     Accept {
         addr: SocketAddr,
         fingerprint: String,
@@ -52,9 +62,16 @@ pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Rc<AsyncMutex<Vec<IncomingConnection>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
+}
+
+#[derive(Clone)]
+struct IncomingConnection {
+    addr: SocketAddr,
+    conn: ArcConn,
+    clipboard: Arc<ClipboardPeer>,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -68,6 +85,7 @@ impl LanMouseListener {
         port: u16,
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        reassembler: SharedClipboardReassembler,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = channel();
@@ -112,13 +130,13 @@ impl LanMouseListener {
         let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
         let mut listener = listen(listen_addr, cfg.clone()).await?;
 
-        let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
-            Rc::new(AsyncMutex::new(Vec::new()));
+        let conns: Rc<AsyncMutex<Vec<IncomingConnection>>> = Rc::new(AsyncMutex::new(Vec::new()));
 
         let conns_clone = conns.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
+            let reassembler = reassembler.clone();
             spawn_local(async move {
                 loop {
                     let sleep = tokio::time::sleep(Duration::from_secs(2));
@@ -128,14 +146,19 @@ impl LanMouseListener {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
+                                let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), reassembler.clone()));
+                                clipboard.advertise().await;
+                                conns_clone.lock().await.push(IncomingConnection {
+                                    addr,
+                                    conn: conn.clone(),
+                                    clipboard: clipboard.clone(),
+                                });
                                 let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
                                 let cert = certs.first().expect("cert");
                                 let fingerprint = crypto::generate_fingerprint(cert);
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
+                                spawn_local(read_loop(conns_clone.clone(), addr, conn, clipboard, listen_tx.clone()));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -197,8 +220,8 @@ impl LanMouseListener {
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
         let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
-            let _ = conn.close().await;
+        for connection in conns.iter() {
+            let _ = connection.conn.close().await;
         }
         self.listen_tx.close();
     }
@@ -207,10 +230,43 @@ impl LanMouseListener {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+        for connection in conns.iter() {
+            if connection.addr == addr {
+                let _ = connection.conn.send(&buf[..len]).await;
             }
+        }
+    }
+
+    pub(crate) async fn broadcast_clipboard_text(
+        &self,
+        update_id: ClipboardUpdateId,
+        text: String,
+    ) {
+        let peers = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .map(|connection| connection.clipboard.clone())
+            .collect::<Vec<_>>();
+        for peer in peers {
+            let text = text.clone();
+            spawn_local(async move {
+                peer.send_text(update_id, &text).await;
+            });
+        }
+    }
+
+    pub(crate) async fn cancel_clipboard_transfers(&self) {
+        let peers = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .map(|connection| connection.clipboard.clone())
+            .collect::<Vec<_>>();
+        for peer in peers {
+            peer.cancel_pending().await;
         }
     }
 
@@ -220,8 +276,8 @@ impl LanMouseListener {
             .lock()
             .await
             .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
+            .find(|connection| connection.addr == addr)
+            .map(|connection| connection.conn.clone())
         {
             let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
             let certs = conn.connection_state().await.peer_certificates;
@@ -246,15 +302,37 @@ impl Stream for LanMouseListener {
 }
 
 async fn read_loop(
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Rc<AsyncMutex<Vec<IncomingConnection>>>,
     addr: SocketAddr,
     conn: ArcConn,
+    clipboard: Arc<ClipboardPeer>,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_EVENT_SIZE];
+    let mut b = [0u8; MAX_CLIPBOARD_FRAME_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
+    loop {
+        let len = match conn.recv(&mut b).await {
+            Ok(len) => len,
+            Err(_) => break,
+        };
+        if ClipboardFrame::is_clipboard_frame(&b[..len]) {
+            match clipboard.handle_frame(&b[..len]).await {
+                Ok(Some((update_id, text))) => dtls_tx
+                    .send(ListenEvent::ClipboardText {
+                        update_id,
+                        text,
+                        addr,
+                    })
+                    .expect("channel closed"),
+                Ok(None) => {}
+                Err(error) => log::debug!("ignoring invalid clipboard frame from {addr}: {error}"),
+            }
+            continue;
+        }
+        let mut event_buf = [0u8; MAX_EVENT_SIZE];
+        let event_len = len.min(MAX_EVENT_SIZE);
+        event_buf[..event_len].copy_from_slice(&b[..event_len]);
+        match event_buf.try_into() {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),
@@ -276,8 +354,10 @@ async fn read_loop(
     let mut conns = conns.lock().await;
     let index = conns
         .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
+        .position(|connection| connection.addr == addr);
+    let Some(index) = index else {
+        return Ok(());
+    };
     conns.remove(index);
     Ok(())
 }

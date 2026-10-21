@@ -1,6 +1,7 @@
 mod authorization_window;
 mod client_object;
 mod client_row;
+mod clipboard;
 mod fingerprint_window;
 mod key_object;
 mod key_row;
@@ -8,6 +9,8 @@ mod key_row;
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+#[cfg(target_os = "linux")]
+mod linux_tray;
 mod window;
 #[cfg(windows)]
 mod windows_tray;
@@ -42,6 +45,7 @@ use gtk::{gio, glib, prelude::ApplicationExt};
 
 use self::client_object::ClientObject;
 use self::key_object::KeyObject;
+use self::clipboard::ClipboardSync;
 
 use thiserror::Error;
 
@@ -87,11 +91,13 @@ fn gtk_main() -> glib::ExitCode {
         .application_id("de.feschber.LanMouse")
         .build();
 
-    app.connect_startup(|app| {
+    app.connect_startup(|_app| {
         load_css();
         load_icons();
-        setup_actions(app);
-        setup_menu(app);
+        #[cfg(not(target_os = "linux"))]
+        setup_actions(_app);
+        #[cfg(not(target_os = "linux"))]
+        setup_menu(_app);
     });
     app.connect_activate(build_ui);
 
@@ -174,6 +180,7 @@ fn load_icons() {
 }
 
 // Add application actions
+#[cfg(not(target_os = "linux"))]
 fn setup_actions(app: &adw::Application) {
     // Quit action
     // This is important on macOS, where users expect a File->Quit action with a Cmd+Q shortcut.
@@ -190,6 +197,7 @@ fn setup_actions(app: &adw::Application) {
 // Set up a global menu
 //
 // Currently this is used only on macOS
+#[cfg(not(target_os = "linux"))]
 fn setup_menu(app: &adw::Application) {
     let menu = gio::Menu::new();
 
@@ -248,6 +256,7 @@ fn build_ui(app: &Application) {
     });
 
     let window = Window::new(app, frontend_tx);
+    let clipboard_sync = ClipboardSync::new(&window);
     #[cfg(target_os = "macos")]
     {
         window.connect_close_request(|window| {
@@ -326,6 +335,13 @@ fn build_ui(app: &Application) {
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
+                    FrontendEvent::ClipboardSharing(enabled) => {
+                        window.set_clipboard_sharing(enabled);
+                        clipboard_sync.set_enabled(enabled);
+                    }
+                    FrontendEvent::ClipboardUpdate { update_id, text } => {
+                        clipboard_sync.apply_remote_text(update_id, text);
+                    }
                 }
             }
         }
@@ -340,7 +356,18 @@ fn build_ui(app: &Application) {
         windows_tray::setup(app, &window);
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    if linux_tray::setup(app, &window) {
+        window.connect_close_request(|window| {
+            window.set_visible(false);
+            glib::Propagation::Stop
+        });
+    } else {
+        log::warn!("Linux tray is unavailable; opening Lan Mouse normally");
+        window.present();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     window.present();
 
     // On macOS, default to presenting the main window on every launch

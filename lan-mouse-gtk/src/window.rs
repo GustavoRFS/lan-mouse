@@ -410,6 +410,19 @@ impl Window {
         self.request(FrontendRequest::EnableEmulation);
     }
 
+    fn request_clipboard_sharing(&self, enabled: bool) {
+        self.request(FrontendRequest::SetClipboardSharing(enabled));
+    }
+
+    pub(super) fn send_clipboard_text(&self, text: String) {
+        self.request(FrontendRequest::ClipboardText(text));
+    }
+
+    pub(super) fn set_clipboard_sharing(&self, enabled: bool) {
+        self.imp().clipboard_sharing.set(enabled);
+        self.imp().clipboard_sharing_switch.set_active(enabled);
+    }
+
     fn request_client_create(&self) {
         self.request(FrontendRequest::Create);
     }

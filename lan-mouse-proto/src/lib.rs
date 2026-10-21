@@ -1,9 +1,12 @@
 use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fmt::{Debug, Display, Formatter},
     mem::size_of,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -11,6 +14,29 @@ use thiserror::Error;
 /// this is currently the pointer motion event
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+
+/// Maximum size of a clipboard frame carried as one DTLS application datagram.
+pub const MAX_CLIPBOARD_FRAME_SIZE: usize = 1200;
+/// Maximum UTF-8 text size accepted in one clipboard update.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+/// Maximum text bytes buffered across incomplete clipboard updates.
+pub const MAX_CLIPBOARD_REASSEMBLY_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum number of incomplete clipboard updates buffered at once.
+pub const MAX_CLIPBOARD_REASSEMBLIES: usize = 64;
+
+const CLIPBOARD_FRAME_MAGIC: u8 = 0xff;
+const CLIPBOARD_FRAME_VERSION: u8 = 1;
+const CLIPBOARD_FRAME_PREFIX_SIZE: usize = 3;
+const TEXT_CHUNK_HEADER_SIZE: usize = CLIPBOARD_FRAME_PREFIX_SIZE + 16 + 2 + 2 + 4 + 32;
+const TEXT_CHUNK_CAPACITY: usize = MAX_CLIPBOARD_FRAME_SIZE - TEXT_CHUNK_HEADER_SIZE;
+const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPLETED_ID_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_COMPLETED_IDS: usize = 128;
+const MAX_CLIPBOARD_ORIGINS: usize = 128;
+
+/// A sender-generated id: 8 random origin bytes followed by a monotonically
+/// increasing 64-bit sequence number, both in network byte order.
+pub type ClipboardUpdateId = [u8; 16];
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -21,6 +47,452 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// Clipboard frame is malformed or has an unsupported version.
+    #[error("invalid clipboard frame")]
+    InvalidClipboardFrame,
+    /// Clipboard text exceeds the protocol limit.
+    #[error("clipboard text exceeds the {MAX_CLIPBOARD_TEXT_BYTES}-byte limit")]
+    ClipboardTextTooLarge,
+    /// Clipboard receiver exceeded its bounded reassembly budget.
+    #[error("clipboard reassembly budget exceeded")]
+    ClipboardReassemblyLimit,
+    /// Reassembled clipboard data is not UTF-8 text.
+    #[error("clipboard text is not valid UTF-8")]
+    ClipboardInvalidUtf8,
+    /// Reassembled text did not match the announced SHA-256 digest.
+    #[error("clipboard text checksum mismatch")]
+    ClipboardChecksumMismatch,
+}
+
+/// Application frames for clipboard synchronization. These are deliberately
+/// distinct from [`ProtoEvent`], whose encoded size is fixed for input events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardFrame {
+    Capabilities,
+    CapabilitiesAck,
+    TextChunk {
+        update_id: ClipboardUpdateId,
+        index: u16,
+        count: u16,
+        total_bytes: u32,
+        checksum: [u8; 32],
+        payload: Vec<u8>,
+    },
+    TextChunkAck {
+        update_id: ClipboardUpdateId,
+        index: u16,
+    },
+    TextUpdateAck(ClipboardUpdateId),
+    TextUpdateNack(ClipboardUpdateId),
+}
+
+impl ClipboardFrame {
+    pub fn is_clipboard_frame(data: &[u8]) -> bool {
+        data.first() == Some(&CLIPBOARD_FRAME_MAGIC)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut buf = vec![CLIPBOARD_FRAME_MAGIC, CLIPBOARD_FRAME_VERSION];
+        match self {
+            Self::Capabilities => buf.push(1),
+            Self::CapabilitiesAck => buf.push(2),
+            Self::TextChunk {
+                update_id,
+                index,
+                count,
+                total_bytes,
+                checksum,
+                payload,
+            } => {
+                if *count == 0
+                    || *index >= *count
+                    || *total_bytes as usize > MAX_CLIPBOARD_TEXT_BYTES
+                    || payload.len() > TEXT_CHUNK_CAPACITY
+                {
+                    return Err(ProtocolError::InvalidClipboardFrame);
+                }
+                let expected_count = chunk_count(*total_bytes as usize);
+                let expected_payload_len = if *index + 1 < *count {
+                    TEXT_CHUNK_CAPACITY
+                } else {
+                    (*total_bytes as usize).saturating_sub(
+                        TEXT_CHUNK_CAPACITY * (*count as usize - 1),
+                    )
+                };
+                if *count as usize != expected_count || payload.len() != expected_payload_len {
+                    return Err(ProtocolError::InvalidClipboardFrame);
+                }
+                buf.push(3);
+                buf.extend_from_slice(update_id);
+                buf.extend_from_slice(&index.to_be_bytes());
+                buf.extend_from_slice(&count.to_be_bytes());
+                buf.extend_from_slice(&total_bytes.to_be_bytes());
+                buf.extend_from_slice(checksum);
+                buf.extend_from_slice(payload);
+            }
+            Self::TextChunkAck { update_id, index } => {
+                buf.push(4);
+                buf.extend_from_slice(update_id);
+                buf.extend_from_slice(&index.to_be_bytes());
+            }
+            Self::TextUpdateAck(update_id) => {
+                buf.push(5);
+                buf.extend_from_slice(update_id);
+            }
+            Self::TextUpdateNack(update_id) => {
+                buf.push(6);
+                buf.extend_from_slice(update_id);
+            }
+        }
+        if buf.len() > MAX_CLIPBOARD_FRAME_SIZE {
+            return Err(ProtocolError::InvalidClipboardFrame);
+        }
+        Ok(buf)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < CLIPBOARD_FRAME_PREFIX_SIZE
+            || data.len() > MAX_CLIPBOARD_FRAME_SIZE
+            || data[0] != CLIPBOARD_FRAME_MAGIC
+            || data[1] != CLIPBOARD_FRAME_VERSION
+        {
+            return Err(ProtocolError::InvalidClipboardFrame);
+        }
+        let kind = data[2];
+        let payload = &data[CLIPBOARD_FRAME_PREFIX_SIZE..];
+        match kind {
+            1 if payload.is_empty() => Ok(Self::Capabilities),
+            2 if payload.is_empty() => Ok(Self::CapabilitiesAck),
+            3 if payload.len() >= 56 => {
+                let update_id = payload[..16]
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+                let index = u16::from_be_bytes(
+                    payload[16..18]
+                        .try_into()
+                        .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+                );
+                let count = u16::from_be_bytes(
+                    payload[18..20]
+                        .try_into()
+                        .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+                );
+                let total_bytes = u32::from_be_bytes(
+                    payload[20..24]
+                        .try_into()
+                        .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+                );
+                let checksum = payload[24..56]
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+                let payload = payload[56..].to_vec();
+                let frame = Self::TextChunk {
+                    update_id,
+                    index,
+                    count,
+                    total_bytes,
+                    checksum,
+                    payload,
+                };
+                // Reuse the encoder's shape validation after decoding fields.
+                frame.encode()?;
+                Ok(frame)
+            }
+            4 if payload.len() == 18 => Ok(Self::TextChunkAck {
+                update_id: payload[..16]
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+                index: u16::from_be_bytes(
+                    payload[16..18]
+                        .try_into()
+                        .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+                ),
+            }),
+            5 if payload.len() == 16 => Ok(Self::TextUpdateAck(
+                payload
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+            )),
+            6 if payload.len() == 16 => Ok(Self::TextUpdateNack(
+                payload
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+            )),
+            _ => Err(ProtocolError::InvalidClipboardFrame),
+        }
+    }
+}
+
+pub fn chunk_text(
+    update_id: ClipboardUpdateId,
+    text: &str,
+) -> Result<Vec<ClipboardFrame>, ProtocolError> {
+    let bytes = text.as_bytes();
+    if bytes.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        return Err(ProtocolError::ClipboardTextTooLarge);
+    }
+    let count = chunk_count(bytes.len());
+    let count = u16::try_from(count).map_err(|_| ProtocolError::ClipboardTextTooLarge)?;
+    let checksum: [u8; 32] = Sha256::digest(bytes).into();
+    if bytes.is_empty() {
+        return Ok(vec![ClipboardFrame::TextChunk {
+            update_id,
+            index: 0,
+            count: 1,
+            total_bytes: 0,
+            checksum,
+            payload: Vec::new(),
+        }]);
+    }
+
+    let mut frames = Vec::with_capacity(count as usize);
+    for (index, payload) in bytes.chunks(TEXT_CHUNK_CAPACITY).enumerate() {
+        frames.push(ClipboardFrame::TextChunk {
+            update_id,
+            index: index as u16,
+            count,
+            total_bytes: bytes.len() as u32,
+            checksum,
+            payload: payload.to_vec(),
+        });
+    }
+    Ok(frames)
+}
+
+/// Bounded receiver-side assembly for text chunks from all peer sessions.
+#[derive(Default)]
+pub struct ClipboardReassembler {
+    partials: HashMap<ClipboardUpdateId, PartialClipboardText>,
+    completed: HashMap<ClipboardUpdateId, Instant>,
+    latest_sequence: HashMap<[u8; 8], (u64, Instant)>,
+    buffered_bytes: usize,
+}
+
+struct PartialClipboardText {
+    count: u16,
+    total_bytes: usize,
+    checksum: [u8; 32],
+    chunks: Vec<Option<Vec<u8>>>,
+    received_chunks: usize,
+    received_bytes: usize,
+    updated: Instant,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ClipboardReassemblyResult {
+    Pending,
+    DuplicateChunk,
+    DuplicateUpdate,
+    StaleUpdate,
+    Complete(String),
+}
+
+impl ClipboardReassembler {
+    pub fn push(
+        &mut self,
+        update_id: ClipboardUpdateId,
+        index: u16,
+        count: u16,
+        total_bytes: u32,
+        checksum: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<ClipboardReassemblyResult, ProtocolError> {
+        self.expire();
+        if self.completed.contains_key(&update_id) {
+            return Ok(ClipboardReassemblyResult::DuplicateUpdate);
+        }
+        let total_bytes = total_bytes as usize;
+        if count == 0
+            || index >= count
+            || total_bytes > MAX_CLIPBOARD_TEXT_BYTES
+            || count as usize != chunk_count(total_bytes)
+            || payload.len() > TEXT_CHUNK_CAPACITY
+        {
+            return Err(ProtocolError::InvalidClipboardFrame);
+        }
+
+        let expected_payload_len = if index + 1 < count {
+            TEXT_CHUNK_CAPACITY
+        } else {
+            total_bytes.saturating_sub(TEXT_CHUNK_CAPACITY * (count as usize - 1))
+        };
+        if payload.len() != expected_payload_len {
+            self.remove_partial(&update_id);
+            return Err(ProtocolError::InvalidClipboardFrame);
+        }
+
+        let origin: [u8; 8] = update_id[..8]
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+        let sequence = u64::from_be_bytes(
+            update_id[8..]
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
+        );
+        if let Some((latest, _)) = self.latest_sequence.get(&origin) {
+            if sequence < *latest {
+                return Ok(ClipboardReassemblyResult::StaleUpdate);
+            }
+        }
+        if self
+            .latest_sequence
+            .get(&origin)
+            .is_none_or(|(latest, _)| sequence > *latest)
+        {
+            let superseded = self
+                .partials
+                .keys()
+                .filter(|id| {
+                    id[..8] == origin
+                        && u64::from_be_bytes(id[8..].try_into().expect("fixed update id"))
+                            < sequence
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            for old_id in superseded {
+                self.remove_partial(&old_id);
+            }
+            if !self.latest_sequence.contains_key(&origin)
+                && self.latest_sequence.len() >= MAX_CLIPBOARD_ORIGINS
+            {
+                if let Some(oldest) = self
+                    .latest_sequence
+                    .iter()
+                    .min_by_key(|(_, (_, updated))| *updated)
+                    .map(|(origin, _)| *origin)
+                {
+                    self.latest_sequence.remove(&oldest);
+                }
+            }
+            self.latest_sequence
+                .insert(origin, (sequence, Instant::now()));
+        } else if let Some((_, updated)) = self.latest_sequence.get_mut(&origin) {
+            *updated = Instant::now();
+        }
+
+        if !self.partials.contains_key(&update_id) {
+            if self.partials.len() >= MAX_CLIPBOARD_REASSEMBLIES {
+                return Err(ProtocolError::ClipboardReassemblyLimit);
+            }
+            self.partials.insert(
+                update_id,
+                PartialClipboardText {
+                    count,
+                    total_bytes,
+                    checksum,
+                    chunks: vec![None; count as usize],
+                    received_chunks: 0,
+                    received_bytes: 0,
+                    updated: Instant::now(),
+                },
+            );
+        }
+
+        let metadata_matches = self.partials.get(&update_id).is_some_and(|partial| {
+            partial.count == count
+                && partial.total_bytes == total_bytes
+                && partial.checksum == checksum
+        });
+        if !metadata_matches {
+            self.remove_partial(&update_id);
+            return Err(ProtocolError::InvalidClipboardFrame);
+        }
+        if let Some(existing) = self
+            .partials
+            .get(&update_id)
+            .and_then(|partial| partial.chunks[index as usize].as_ref())
+        {
+            if existing == &payload {
+                self.partials
+                    .get_mut(&update_id)
+                    .expect("partial exists")
+                    .updated = Instant::now();
+                return Ok(ClipboardReassemblyResult::DuplicateChunk);
+            }
+            self.remove_partial(&update_id);
+            return Err(ProtocolError::InvalidClipboardFrame);
+        }
+        if self.buffered_bytes.saturating_add(payload.len()) > MAX_CLIPBOARD_REASSEMBLY_BYTES {
+            self.remove_partial(&update_id);
+            return Err(ProtocolError::ClipboardReassemblyLimit);
+        }
+
+        let payload_len = payload.len();
+        let complete = {
+            let partial = self
+                .partials
+                .get_mut(&update_id)
+                .expect("partial exists");
+            partial.received_bytes += payload_len;
+            partial.received_chunks += 1;
+            partial.updated = Instant::now();
+            partial.chunks[index as usize] = Some(payload);
+            partial.received_chunks == partial.count as usize
+        };
+        self.buffered_bytes = self.buffered_bytes.saturating_add(payload_len);
+
+        if !complete {
+            return Ok(ClipboardReassemblyResult::Pending);
+        }
+
+        let partial = self.partials.remove(&update_id).expect("complete partial exists");
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(partial.received_bytes);
+        let mut bytes = Vec::with_capacity(partial.total_bytes);
+        for chunk in &partial.chunks {
+            bytes.extend_from_slice(chunk.as_deref().ok_or(ProtocolError::InvalidClipboardFrame)?);
+        }
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if bytes.len() != partial.total_bytes || digest != checksum {
+            return Err(ProtocolError::ClipboardChecksumMismatch);
+        }
+        let text = String::from_utf8(bytes).map_err(|_| ProtocolError::ClipboardInvalidUtf8)?;
+        self.completed.insert(update_id, Instant::now());
+        self.trim_completed();
+        Ok(ClipboardReassemblyResult::Complete(text))
+    }
+
+    pub fn expire(&mut self) {
+        let expired = self
+            .partials
+            .iter()
+            .filter(|(_, partial)| partial.updated.elapsed() >= REASSEMBLY_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for update_id in expired {
+            self.remove_partial(&update_id);
+        }
+        self.completed
+            .retain(|_, inserted| inserted.elapsed() < COMPLETED_ID_TIMEOUT);
+        self.latest_sequence
+            .retain(|_, (_, updated)| updated.elapsed() < COMPLETED_ID_TIMEOUT);
+    }
+
+    fn remove_partial(&mut self, update_id: &ClipboardUpdateId) {
+        if let Some(partial) = self.partials.remove(update_id) {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(partial.received_bytes);
+        }
+    }
+
+    fn trim_completed(&mut self) {
+        while self.completed.len() > MAX_COMPLETED_IDS {
+            if let Some(oldest) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, inserted)| **inserted)
+                .map(|(id, _)| *id)
+            {
+                self.completed.remove(&oldest);
+            }
+        }
+    }
+}
+
+fn chunk_count(bytes: usize) -> usize {
+    if bytes == 0 {
+        1
+    } else {
+        bytes.div_ceil(TEXT_CHUNK_CAPACITY)
+    }
 }
 
 /// Position of a client

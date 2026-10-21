@@ -1,7 +1,12 @@
-use crate::client::ClientManager;
+use crate::{
+    client::ClientManager,
+    clipboard::{ClipboardPeer, SharedClipboardReassembler},
+};
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{
+    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -42,6 +47,21 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+type ArcConn = Arc<dyn Conn + Send + Sync>;
+
+#[derive(Clone)]
+struct ClientConnection {
+    conn: ArcConn,
+    clipboard: Arc<ClipboardPeer>,
+}
+
+pub(crate) enum NetworkEvent {
+    Proto(ProtoEvent),
+    ClipboardText {
+        update_id: ClipboardUpdateId,
+        text: String,
+    },
+}
 
 async fn connect(
     addr: SocketAddr,
@@ -95,15 +115,20 @@ async fn connect_any(
 pub(crate) struct LanMouseConnection {
     cert: Certificate,
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    conns: Rc<Mutex<HashMap<SocketAddr, ClientConnection>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<(ClientHandle, NetworkEvent)>,
+    recv_tx: Sender<(ClientHandle, NetworkEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    reassembler: SharedClipboardReassembler,
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        reassembler: SharedClipboardReassembler,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
@@ -113,11 +138,48 @@ impl LanMouseConnection {
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
+            reassembler,
         }
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    pub(crate) async fn recv(&mut self) -> (ClientHandle, NetworkEvent) {
         self.recv_rx.recv().await.expect("channel closed")
+    }
+
+    pub(crate) async fn broadcast_clipboard_text(
+        &self,
+        update_id: ClipboardUpdateId,
+        text: String,
+    ) {
+        let mut peers = Vec::new();
+        for handle in self.client_manager.active_clients() {
+            if let Some(addr) = self.client_manager.active_addr(handle) {
+                let conns = self.conns.lock().await;
+                if let Some(connection) = conns.get(&addr) {
+                    peers.push(connection.clipboard.clone());
+                }
+            }
+        }
+
+        for peer in peers {
+            let text = text.clone();
+            spawn_local(async move {
+                peer.send_text(update_id, &text).await;
+            });
+        }
+    }
+
+    pub(crate) async fn cancel_clipboard_transfers(&self) {
+        let peers = self
+            .conns
+            .lock()
+            .await
+            .values()
+            .map(|connection| connection.clipboard.clone())
+            .collect::<Vec<_>>();
+        for peer in peers {
+            peer.cancel_pending().await;
+        }
     }
 
     pub(crate) async fn send(
@@ -128,15 +190,15 @@ impl LanMouseConnection {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
+            let connection = {
                 let conns = self.conns.lock().await;
                 conns.get(&addr).cloned()
             };
-            if let Some(conn) = conn {
+            if let Some(connection) = connection {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(buf).await {
+                match connection.conn.send(buf).await {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
@@ -161,6 +223,7 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
+                self.reassembler.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -171,10 +234,11 @@ async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
     handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    conns: Rc<Mutex<HashMap<SocketAddr, ClientConnection>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<(ClientHandle, NetworkEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    reassembler: SharedClipboardReassembler,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
@@ -195,7 +259,15 @@ async fn connect_to_handle(
         };
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
+        let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), reassembler));
+        clipboard.advertise().await;
+        conns.lock().await.insert(
+            addr,
+            ClientConnection {
+                conn: conn.clone(),
+                clipboard: clipboard.clone(),
+            },
+        );
         connecting.lock().await.remove(&handle);
 
         // Best-effort version handshake. Send our commit hash once
@@ -220,6 +292,7 @@ async fn connect_to_handle(
             handle,
             addr,
             conn,
+            clipboard,
             conns,
             tx,
             ping_response.clone(),
@@ -262,14 +335,33 @@ async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    conn: ArcConn,
+    clipboard: Arc<ClipboardPeer>,
+    conns: Rc<Mutex<HashMap<SocketAddr, ClientConnection>>>,
+    tx: Sender<(ClientHandle, NetworkEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        match buf.try_into() {
+    let mut buf = [0u8; MAX_CLIPBOARD_FRAME_SIZE];
+    loop {
+        let len = match conn.recv(&mut buf).await {
+            Ok(len) => len,
+            Err(_) => break,
+        };
+        if ClipboardFrame::is_clipboard_frame(&buf[..len]) {
+            match clipboard.handle_frame(&buf[..len]).await {
+                Ok(Some((update_id, text))) => {
+                    tx.send((handle, NetworkEvent::ClipboardText { update_id, text }))
+                        .expect("channel closed");
+                }
+                Ok(None) => {}
+                Err(error) => log::debug!("ignoring invalid clipboard frame from {addr}: {error}"),
+            }
+            continue;
+        }
+        let mut event_buf = [0u8; MAX_EVENT_SIZE];
+        let event_len = len.min(MAX_EVENT_SIZE);
+        event_buf[..event_len].copy_from_slice(&buf[..event_len]);
+        match event_buf.try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
@@ -281,7 +373,9 @@ async fn receive_loop(
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => tx
+                        .send((handle, NetworkEvent::Proto(event)))
+                        .expect("channel closed"),
                 }
             }
             // Skip undecodable datagrams without dropping the
@@ -299,7 +393,7 @@ async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    conns: &Mutex<HashMap<SocketAddr, ClientConnection>>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);

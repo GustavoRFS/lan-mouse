@@ -69,6 +69,7 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    clipboard_sharing: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -457,6 +458,14 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// whether clipboard text synchronization is enabled
+    pub fn clipboard_sharing(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_sharing)
+            .unwrap_or(true)
+    }
+
     /// path to certificate
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
@@ -525,6 +534,17 @@ impl Config {
             .as_mut()
             .expect("config")
             .authorized_fingerprints = Some(fingerprints);
+    }
+
+    /// persist clipboard text synchronization preference
+    pub fn set_clipboard_sharing(&mut self, enabled: bool) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml
+            .as_mut()
+            .expect("config")
+            .clipboard_sharing = Some(enabled);
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {

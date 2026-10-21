@@ -3,7 +3,7 @@ use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{Position, ProtoEvent};
+use lan_mouse_proto::{ClipboardUpdateId, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -64,11 +64,21 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         commit: [u8; 8],
     },
+    ClipboardText {
+        addr: SocketAddr,
+        update_id: ClipboardUpdateId,
+        text: String,
+    },
 }
 
 enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
+    ClipboardText {
+        update_id: ClipboardUpdateId,
+        text: String,
+    },
+    CancelClipboardTransfers,
     ChangePort(u16),
     Terminate,
 }
@@ -98,6 +108,22 @@ impl Emulation {
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Release(addr))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn broadcast_clipboard_text(
+        &self,
+        update_id: ClipboardUpdateId,
+        text: String,
+    ) {
+        self.request_tx
+            .send(EmulationRequest::ClipboardText { update_id, text })
+            .expect("channel closed");
+    }
+
+    pub(crate) fn cancel_clipboard_transfers(&self) {
+        self.request_tx
+            .send(EmulationRequest::CancelClipboardTransfers)
             .expect("channel closed");
     }
 
@@ -180,6 +206,9 @@ impl ListenTask {
                             _ => {}
                         }
                     }
+                    Some(ListenEvent::ClipboardText { update_id, text, addr }) => {
+                        self.event_tx.send(EmulationEvent::ClipboardText { addr, update_id, text }).expect("channel closed");
+                    }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
@@ -199,6 +228,12 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::ClipboardText { update_id, text } => {
+                        self.listener.broadcast_clipboard_text(update_id, text).await;
+                    }
+                    EmulationRequest::CancelClipboardTransfers => {
+                        self.listener.cancel_clipboard_transfers().await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

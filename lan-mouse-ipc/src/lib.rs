@@ -226,6 +226,13 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// persisted clipboard sharing preference
+    ClipboardSharing(bool),
+    /// text clipboard update received from an authenticated peer
+    ClipboardUpdate {
+        update_id: [u8; 16],
+        text: String,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -266,6 +273,10 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// enable or pause clipboard sharing
+    SetClipboardSharing(bool),
+    /// publish a locally changed plain-text clipboard value
+    ClipboardText(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

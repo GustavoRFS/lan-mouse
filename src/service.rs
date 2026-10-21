@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::SharedClipboardReassembler,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -13,6 +14,7 @@ use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
+use lan_mouse_proto::{ClipboardReassembler, ClipboardUpdateId, MAX_CLIPBOARD_TEXT_BYTES};
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -62,6 +64,12 @@ pub struct Service {
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
+    /// whether clipboard text updates are shared/applied
+    clipboard_sharing: bool,
+    /// random per-process origin prefix for update ids
+    clipboard_origin: [u8; 8],
+    /// monotonic per-process clipboard update sequence
+    clipboard_sequence: u64,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
@@ -86,15 +94,30 @@ impl Service {
         // load certificate
         let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
         let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        let clipboard_sharing = config.clipboard_sharing();
+        let clipboard_origin: [u8; 8] = uuid::Uuid::new_v4().as_bytes()[..8]
+            .try_into()
+            .expect("UUID prefix length");
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let clipboard_reassembler: SharedClipboardReassembler =
+            Arc::new(tokio::sync::Mutex::new(ClipboardReassembler::default()));
         // listener + connection
-        let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let listener = LanMouseListener::new(
+            config.port(),
+            cert.clone(),
+            authorized_keys.clone(),
+            clipboard_reassembler.clone(),
+        )
+        .await?;
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            clipboard_reassembler,
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -123,6 +146,9 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            clipboard_sharing,
+            clipboard_origin,
+            clipboard_sequence: 0,
         };
         Ok(service)
     }
@@ -218,6 +244,18 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::SetClipboardSharing(enabled) => {
+                if self.clipboard_sharing != enabled {
+                    self.clipboard_sharing = enabled;
+                    if !enabled {
+                        self.capture.cancel_clipboard_transfers();
+                        self.emulation.cancel_clipboard_transfers();
+                    }
+                    self.save_config();
+                    self.notify_frontend(FrontendEvent::ClipboardSharing(enabled));
+                }
+            }
+            FrontendRequest::ClipboardText(text) => self.share_local_clipboard_text(text),
         }
     }
 
@@ -238,6 +276,7 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
+        self.config.set_clipboard_sharing(self.clipboard_sharing);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -259,6 +298,12 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
+        let clipboard_sharing = self.config.clipboard_sharing();
+        if self.clipboard_sharing && !clipboard_sharing {
+            self.capture.cancel_clipboard_transfers();
+            self.emulation.cancel_clipboard_transfers();
+        }
+        self.clipboard_sharing = clipboard_sharing;
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -331,6 +376,14 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
+            EmulationEvent::ClipboardText {
+                addr,
+                update_id,
+                text,
+            } => {
+                log::trace!("clipboard text received from {addr}");
+                self.apply_remote_clipboard_text(update_id, text);
+            }
         }
     }
 
@@ -358,6 +411,9 @@ impl Service {
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
+            }
+            ICaptureEvent::ClipboardText { update_id, text } => {
+                self.apply_remote_clipboard_text(update_id, text);
             }
         }
     }
@@ -391,12 +447,36 @@ impl Service {
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+        self.notify_frontend(FrontendEvent::ClipboardSharing(self.clipboard_sharing));
         self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+    }
+
+    fn share_local_clipboard_text(&mut self, text: String) {
+        if !self.clipboard_sharing {
+            return;
+        }
+        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            log::debug!("ignoring oversized local clipboard text update");
+            return;
+        }
+        self.clipboard_sequence = self.clipboard_sequence.wrapping_add(1).max(1);
+        let mut update_id: ClipboardUpdateId = [0; 16];
+        update_id[..8].copy_from_slice(&self.clipboard_origin);
+        update_id[8..].copy_from_slice(&self.clipboard_sequence.to_be_bytes());
+        self.capture
+            .broadcast_clipboard_text(update_id, text.clone());
+        self.emulation.broadcast_clipboard_text(update_id, text);
+    }
+
+    fn apply_remote_clipboard_text(&mut self, update_id: ClipboardUpdateId, text: String) {
+        if self.clipboard_sharing {
+            self.notify_frontend(FrontendEvent::ClipboardUpdate { update_id, text });
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
