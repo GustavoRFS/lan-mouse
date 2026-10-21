@@ -19,8 +19,10 @@ pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_
 pub const MAX_CLIPBOARD_FRAME_SIZE: usize = 1200;
 /// Maximum UTF-8 text size accepted in one clipboard update.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+/// Maximum encoded PNG size accepted in one clipboard update.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum text bytes buffered across incomplete clipboard updates.
-pub const MAX_CLIPBOARD_REASSEMBLY_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CLIPBOARD_REASSEMBLY_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum number of incomplete clipboard updates buffered at once.
 pub const MAX_CLIPBOARD_REASSEMBLIES: usize = 64;
 
@@ -53,6 +55,9 @@ pub enum ProtocolError {
     /// Clipboard text exceeds the protocol limit.
     #[error("clipboard text exceeds the {MAX_CLIPBOARD_TEXT_BYTES}-byte limit")]
     ClipboardTextTooLarge,
+    /// Clipboard PNG exceeds the protocol limit.
+    #[error("clipboard image exceeds the {MAX_CLIPBOARD_IMAGE_BYTES}-byte limit")]
+    ClipboardImageTooLarge,
     /// Clipboard receiver exceeded its bounded reassembly budget.
     #[error("clipboard reassembly budget exceeded")]
     ClipboardReassemblyLimit,
@@ -70,7 +75,17 @@ pub enum ProtocolError {
 pub enum ClipboardFrame {
     Capabilities,
     CapabilitiesAck,
+    ImageCapabilities,
+    ImageCapabilitiesAck,
     TextChunk {
+        update_id: ClipboardUpdateId,
+        index: u16,
+        count: u16,
+        total_bytes: u32,
+        checksum: [u8; 32],
+        payload: Vec<u8>,
+    },
+    ImageChunk {
         update_id: ClipboardUpdateId,
         index: u16,
         count: u16,
@@ -96,6 +111,8 @@ impl ClipboardFrame {
         match self {
             Self::Capabilities => buf.push(1),
             Self::CapabilitiesAck => buf.push(2),
+            Self::ImageCapabilities => buf.push(8),
+            Self::ImageCapabilitiesAck => buf.push(9),
             Self::TextChunk {
                 update_id,
                 index,
@@ -103,10 +120,24 @@ impl ClipboardFrame {
                 total_bytes,
                 checksum,
                 payload,
+            }
+            | Self::ImageChunk {
+                update_id,
+                index,
+                count,
+                total_bytes,
+                checksum,
+                payload,
             } => {
+                let is_image = matches!(self, Self::ImageChunk { .. });
+                let max_bytes = if is_image {
+                    MAX_CLIPBOARD_IMAGE_BYTES
+                } else {
+                    MAX_CLIPBOARD_TEXT_BYTES
+                };
                 if *count == 0
                     || *index >= *count
-                    || *total_bytes as usize > MAX_CLIPBOARD_TEXT_BYTES
+                    || *total_bytes as usize > max_bytes
                     || payload.len() > TEXT_CHUNK_CAPACITY
                 {
                     return Err(ProtocolError::InvalidClipboardFrame);
@@ -115,14 +146,13 @@ impl ClipboardFrame {
                 let expected_payload_len = if *index + 1 < *count {
                     TEXT_CHUNK_CAPACITY
                 } else {
-                    (*total_bytes as usize).saturating_sub(
-                        TEXT_CHUNK_CAPACITY * (*count as usize - 1),
-                    )
+                    (*total_bytes as usize)
+                        .saturating_sub(TEXT_CHUNK_CAPACITY * (*count as usize - 1))
                 };
                 if *count as usize != expected_count || payload.len() != expected_payload_len {
                     return Err(ProtocolError::InvalidClipboardFrame);
                 }
-                buf.push(3);
+                buf.push(if is_image { 7 } else { 3 });
                 buf.extend_from_slice(update_id);
                 buf.extend_from_slice(&index.to_be_bytes());
                 buf.extend_from_slice(&count.to_be_bytes());
@@ -163,7 +193,7 @@ impl ClipboardFrame {
         match kind {
             1 if payload.is_empty() => Ok(Self::Capabilities),
             2 if payload.is_empty() => Ok(Self::CapabilitiesAck),
-            3 if payload.len() >= 56 => {
+            3 | 7 if payload.len() >= 56 => {
                 let update_id = payload[..16]
                     .try_into()
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
@@ -186,13 +216,24 @@ impl ClipboardFrame {
                     .try_into()
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
                 let payload = payload[56..].to_vec();
-                let frame = Self::TextChunk {
-                    update_id,
-                    index,
-                    count,
-                    total_bytes,
-                    checksum,
-                    payload,
+                let frame = if kind == 7 {
+                    Self::ImageChunk {
+                        update_id,
+                        index,
+                        count,
+                        total_bytes,
+                        checksum,
+                        payload,
+                    }
+                } else {
+                    Self::TextChunk {
+                        update_id,
+                        index,
+                        count,
+                        total_bytes,
+                        checksum,
+                        payload,
+                    }
                 };
                 // Reuse the encoder's shape validation after decoding fields.
                 frame.encode()?;
@@ -218,6 +259,8 @@ impl ClipboardFrame {
                     .try_into()
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?,
             )),
+            8 if payload.is_empty() => Ok(Self::ImageCapabilities),
+            9 if payload.is_empty() => Ok(Self::ImageCapabilitiesAck),
             _ => Err(ProtocolError::InvalidClipboardFrame),
         }
     }
@@ -259,16 +302,52 @@ pub fn chunk_text(
     Ok(frames)
 }
 
+pub fn chunk_image(
+    update_id: ClipboardUpdateId,
+    png: &[u8],
+) -> Result<Vec<ClipboardFrame>, ProtocolError> {
+    if png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(ProtocolError::ClipboardImageTooLarge);
+    }
+    let count =
+        u16::try_from(chunk_count(png.len())).map_err(|_| ProtocolError::ClipboardImageTooLarge)?;
+    let checksum: [u8; 32] = Sha256::digest(png).into();
+    let chunks = if png.is_empty() {
+        vec![&[][..]]
+    } else {
+        png.chunks(TEXT_CHUNK_CAPACITY).collect::<Vec<_>>()
+    };
+    Ok(chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| ClipboardFrame::ImageChunk {
+            update_id,
+            index: index as u16,
+            count,
+            total_bytes: png.len() as u32,
+            checksum,
+            payload: payload.to_vec(),
+        })
+        .collect())
+}
+
 /// Bounded receiver-side assembly for text chunks from all peer sessions.
 #[derive(Default)]
 pub struct ClipboardReassembler {
-    partials: HashMap<ClipboardUpdateId, PartialClipboardText>,
+    partials: HashMap<ClipboardUpdateId, PartialClipboardData>,
     completed: HashMap<ClipboardUpdateId, Instant>,
     latest_sequence: HashMap<[u8; 8], (u64, Instant)>,
     buffered_bytes: usize,
 }
 
-struct PartialClipboardText {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClipboardDataKind {
+    Text,
+    ImagePng,
+}
+
+struct PartialClipboardData {
+    kind: ClipboardDataKind,
     count: u16,
     total_bytes: usize,
     checksum: [u8; 32],
@@ -285,6 +364,7 @@ pub enum ClipboardReassemblyResult {
     DuplicateUpdate,
     StaleUpdate,
     Complete(String),
+    CompleteImage(Vec<u8>),
 }
 
 impl ClipboardReassembler {
@@ -297,14 +377,60 @@ impl ClipboardReassembler {
         checksum: [u8; 32],
         payload: Vec<u8>,
     ) -> Result<ClipboardReassemblyResult, ProtocolError> {
+        self.push_kind(
+            ClipboardDataKind::Text,
+            update_id,
+            index,
+            count,
+            total_bytes,
+            checksum,
+            payload,
+        )
+    }
+
+    pub fn push_image(
+        &mut self,
+        update_id: ClipboardUpdateId,
+        index: u16,
+        count: u16,
+        total_bytes: u32,
+        checksum: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<ClipboardReassemblyResult, ProtocolError> {
+        self.push_kind(
+            ClipboardDataKind::ImagePng,
+            update_id,
+            index,
+            count,
+            total_bytes,
+            checksum,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_kind(
+        &mut self,
+        kind: ClipboardDataKind,
+        update_id: ClipboardUpdateId,
+        index: u16,
+        count: u16,
+        total_bytes: u32,
+        checksum: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<ClipboardReassemblyResult, ProtocolError> {
         self.expire();
         if self.completed.contains_key(&update_id) {
             return Ok(ClipboardReassemblyResult::DuplicateUpdate);
         }
         let total_bytes = total_bytes as usize;
+        let max_bytes = match kind {
+            ClipboardDataKind::Text => MAX_CLIPBOARD_TEXT_BYTES,
+            ClipboardDataKind::ImagePng => MAX_CLIPBOARD_IMAGE_BYTES,
+        };
         if count == 0
             || index >= count
-            || total_bytes > MAX_CLIPBOARD_TEXT_BYTES
+            || total_bytes > max_bytes
             || count as usize != chunk_count(total_bytes)
             || payload.len() > TEXT_CHUNK_CAPACITY
         {
@@ -376,7 +502,8 @@ impl ClipboardReassembler {
             }
             self.partials.insert(
                 update_id,
-                PartialClipboardText {
+                PartialClipboardData {
+                    kind,
                     count,
                     total_bytes,
                     checksum,
@@ -389,7 +516,8 @@ impl ClipboardReassembler {
         }
 
         let metadata_matches = self.partials.get(&update_id).is_some_and(|partial| {
-            partial.count == count
+            partial.kind == kind
+                && partial.count == count
                 && partial.total_bytes == total_bytes
                 && partial.checksum == checksum
         });
@@ -419,10 +547,7 @@ impl ClipboardReassembler {
 
         let payload_len = payload.len();
         let complete = {
-            let partial = self
-                .partials
-                .get_mut(&update_id)
-                .expect("partial exists");
+            let partial = self.partials.get_mut(&update_id).expect("partial exists");
             partial.received_bytes += payload_len;
             partial.received_chunks += 1;
             partial.updated = Instant::now();
@@ -435,20 +560,32 @@ impl ClipboardReassembler {
             return Ok(ClipboardReassemblyResult::Pending);
         }
 
-        let partial = self.partials.remove(&update_id).expect("complete partial exists");
+        let partial = self
+            .partials
+            .remove(&update_id)
+            .expect("complete partial exists");
         self.buffered_bytes = self.buffered_bytes.saturating_sub(partial.received_bytes);
         let mut bytes = Vec::with_capacity(partial.total_bytes);
         for chunk in &partial.chunks {
-            bytes.extend_from_slice(chunk.as_deref().ok_or(ProtocolError::InvalidClipboardFrame)?);
+            bytes.extend_from_slice(
+                chunk
+                    .as_deref()
+                    .ok_or(ProtocolError::InvalidClipboardFrame)?,
+            );
         }
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if bytes.len() != partial.total_bytes || digest != checksum {
             return Err(ProtocolError::ClipboardChecksumMismatch);
         }
-        let text = String::from_utf8(bytes).map_err(|_| ProtocolError::ClipboardInvalidUtf8)?;
+        let result = match kind {
+            ClipboardDataKind::Text => ClipboardReassemblyResult::Complete(
+                String::from_utf8(bytes).map_err(|_| ProtocolError::ClipboardInvalidUtf8)?,
+            ),
+            ClipboardDataKind::ImagePng => ClipboardReassemblyResult::CompleteImage(bytes),
+        };
         self.completed.insert(update_id, Instant::now());
         self.trim_completed();
-        Ok(ClipboardReassemblyResult::Complete(text))
+        Ok(result)
     }
 
     pub fn expire(&mut self) {

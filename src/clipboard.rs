@@ -10,7 +10,7 @@ use std::{
 use futures::future::join_all;
 use lan_mouse_proto::{
     ClipboardFrame, ClipboardReassembler, ClipboardReassemblyResult, ClipboardUpdateId,
-    ProtocolError, chunk_text,
+    ProtocolError, chunk_image, chunk_text,
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -22,6 +22,21 @@ use webrtc_util::Conn;
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 pub(crate) type SharedClipboardReassembler = Arc<Mutex<ClipboardReassembler>>;
 
+#[derive(Clone)]
+pub(crate) enum ClipboardPayload {
+    Text(String),
+    ImagePng(Vec<u8>),
+}
+
+impl std::fmt::Debug for ClipboardPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => formatter.debug_tuple("Text").field(&text.len()).finish(),
+            Self::ImagePng(png) => formatter.debug_tuple("ImagePng").field(&png.len()).finish(),
+        }
+    }
+}
+
 const ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const UPDATE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CHUNKS_IN_FLIGHT: usize = 8;
@@ -30,6 +45,7 @@ const CAPABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct PeerState {
     supports_clipboard: bool,
+    supports_image: bool,
     chunk_acks: HashMap<(ClipboardUpdateId, u16), oneshot::Sender<()>>,
     update_acks: HashMap<ClipboardUpdateId, oneshot::Sender<bool>>,
     transfer_cancel: CancellationToken,
@@ -39,6 +55,7 @@ impl Default for PeerState {
     fn default() -> Self {
         Self {
             supports_clipboard: false,
+            supports_image: false,
             chunk_acks: HashMap::new(),
             update_acks: HashMap::new(),
             transfer_cancel: CancellationToken::new(),
@@ -70,9 +87,39 @@ impl ClipboardPeer {
         if let Err(error) = self.send_frame(ClipboardFrame::Capabilities).await {
             log::debug!("could not advertise clipboard support: {error}");
         }
+        if let Err(error) = self.send_frame(ClipboardFrame::ImageCapabilities).await {
+            log::debug!("could not advertise image clipboard support: {error}");
+        }
     }
 
     pub(crate) async fn send_text(&self, update_id: ClipboardUpdateId, text: &str) {
+        let frames = match chunk_text(update_id, text) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log::debug!("clipboard text could not be chunked: {error}");
+                return;
+            }
+        };
+        self.send_frames(update_id, frames, false).await;
+    }
+
+    pub(crate) async fn send_image(&self, update_id: ClipboardUpdateId, png: &[u8]) {
+        let frames = match chunk_image(update_id, png) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log::debug!("clipboard image could not be chunked: {error}");
+                return;
+            }
+        };
+        self.send_frames(update_id, frames, true).await;
+    }
+
+    async fn send_frames(
+        &self,
+        update_id: ClipboardUpdateId,
+        frames: Vec<ClipboardFrame>,
+        image: bool,
+    ) {
         let (generation, cancellation) = {
             let mut state = self.state.lock().await;
             state.transfer_cancel.cancel();
@@ -82,27 +129,23 @@ impl ClipboardPeer {
             (generation, cancellation)
         };
         if !self
-            .wait_until_ready(generation, &cancellation)
+            .wait_until_ready(generation, &cancellation, image)
             .await
             || !self.is_current(generation)
         {
             return;
         }
 
-        let frames = match chunk_text(update_id, text) {
-            Ok(frames) => frames,
-            Err(error) => {
-                log::debug!("clipboard text could not be chunked: {error}");
-                return;
-            }
-        };
-
         for _ in 0..MAX_RETRIES {
             if !self.is_current(generation) {
                 return;
             }
             let (ack_tx, ack_rx) = oneshot::channel();
-            self.state.lock().await.update_acks.insert(update_id, ack_tx);
+            self.state
+                .lock()
+                .await
+                .update_acks
+                .insert(update_id, ack_tx);
 
             let mut transfer_ok = true;
             for group in frames.chunks(MAX_CHUNKS_IN_FLIGHT) {
@@ -110,18 +153,9 @@ impl ClipboardPeer {
                     transfer_ok = false;
                     break;
                 }
-                let results = join_all(
-                    group
-                        .iter()
-                        .cloned()
-                        .map(|frame| {
-                            self.send_chunk_with_retry(
-                                generation,
-                                cancellation.clone(),
-                                frame,
-                            )
-                        }),
-                )
+                let results = join_all(group.iter().cloned().map(|frame| {
+                    self.send_chunk_with_retry(generation, cancellation.clone(), frame)
+                }))
                 .await;
                 if results.iter().any(|ok| !ok) {
                     transfer_ok = false;
@@ -160,9 +194,11 @@ impl ClipboardPeer {
     pub(crate) async fn handle_frame(
         &self,
         data: &[u8],
-    ) -> Result<Option<(ClipboardUpdateId, String)>, ProtocolError> {
+    ) -> Result<Option<(ClipboardUpdateId, ClipboardPayload)>, ProtocolError> {
         self.reassembler.lock().await.expire();
-        match ClipboardFrame::decode(data)? {
+        let frame = ClipboardFrame::decode(data)?;
+        let image = matches!(frame, ClipboardFrame::ImageChunk { .. });
+        match frame {
             ClipboardFrame::Capabilities => {
                 self.mark_supported().await;
                 self.send_frame(ClipboardFrame::CapabilitiesAck)
@@ -170,6 +206,13 @@ impl ClipboardPeer {
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
             }
             ClipboardFrame::CapabilitiesAck => self.mark_supported().await,
+            ClipboardFrame::ImageCapabilities => {
+                self.mark_image_supported().await;
+                self.send_frame(ClipboardFrame::ImageCapabilitiesAck)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+            }
+            ClipboardFrame::ImageCapabilitiesAck => self.mark_image_supported().await,
             ClipboardFrame::TextChunk {
                 update_id,
                 index,
@@ -177,15 +220,37 @@ impl ClipboardPeer {
                 total_bytes,
                 checksum,
                 payload,
+            }
+            | ClipboardFrame::ImageChunk {
+                update_id,
+                index,
+                count,
+                total_bytes,
+                checksum,
+                payload,
             } => {
-                if !self.supports_clipboard().await {
+                if !self.supports_kind(image).await {
                     return Err(ProtocolError::InvalidClipboardFrame);
                 }
-                let result = self
-                    .reassembler
-                    .lock()
-                    .await
-                    .push(update_id, index, count, total_bytes, checksum, payload);
+                let result = if image {
+                    self.reassembler.lock().await.push_image(
+                        update_id,
+                        index,
+                        count,
+                        total_bytes,
+                        checksum,
+                        payload,
+                    )
+                } else {
+                    self.reassembler.lock().await.push(
+                        update_id,
+                        index,
+                        count,
+                        total_bytes,
+                        checksum,
+                        payload,
+                    )
+                };
                 match result {
                     Ok(ClipboardReassemblyResult::Pending)
                     | Ok(ClipboardReassemblyResult::DuplicateChunk) => {
@@ -209,7 +274,16 @@ impl ClipboardPeer {
                         self.send_frame(ClipboardFrame::TextUpdateAck(update_id))
                             .await
                             .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
-                        return Ok(Some((update_id, text)));
+                        return Ok(Some((update_id, ClipboardPayload::Text(text))));
+                    }
+                    Ok(ClipboardReassemblyResult::CompleteImage(png)) => {
+                        self.send_frame(ClipboardFrame::TextChunkAck { update_id, index })
+                            .await
+                            .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+                        self.send_frame(ClipboardFrame::TextUpdateAck(update_id))
+                            .await
+                            .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+                        return Ok(Some((update_id, ClipboardPayload::ImagePng(png))));
                     }
                     Err(error) => {
                         let _ = self
@@ -252,20 +326,21 @@ impl ClipboardPeer {
         &self,
         generation: u64,
         cancellation: &CancellationToken,
+        image: bool,
     ) -> bool {
         let deadline = tokio::time::Instant::now() + CAPABILITY_TIMEOUT;
         loop {
             if !self.is_current(generation) || cancellation.is_cancelled() {
                 return false;
             }
-            if self.supports_clipboard().await {
+            if self.supports_kind(image).await {
                 return true;
             }
             let notified = self.ready.notified();
             if !self.is_current(generation) || cancellation.is_cancelled() {
                 return false;
             }
-            if self.supports_clipboard().await {
+            if self.supports_kind(image).await {
                 return true;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -276,7 +351,12 @@ impl ClipboardPeer {
                 _ = cancellation.cancelled() => return false,
                 result = timeout(remaining.min(Duration::from_millis(500)), notified) => {
                     if result.is_err() {
-                        if let Err(error) = self.send_frame(ClipboardFrame::Capabilities).await {
+                        let capability = if image {
+                            ClipboardFrame::ImageCapabilities
+                        } else {
+                            ClipboardFrame::Capabilities
+                        };
+                        if let Err(error) = self.send_frame(capability).await {
                             log::debug!("clipboard capability retry failed: {error}");
                         }
                     }
@@ -289,8 +369,25 @@ impl ClipboardPeer {
         self.state.lock().await.supports_clipboard
     }
 
+    async fn supports_image(&self) -> bool {
+        self.state.lock().await.supports_image
+    }
+
+    async fn supports_kind(&self, image: bool) -> bool {
+        if image {
+            self.supports_image().await
+        } else {
+            self.supports_clipboard().await
+        }
+    }
+
     async fn mark_supported(&self) {
         self.state.lock().await.supports_clipboard = true;
+        self.ready.notify_waiters();
+    }
+
+    async fn mark_image_supported(&self) {
+        self.state.lock().await.supports_image = true;
         self.ready.notify_waiters();
     }
 
@@ -300,8 +397,14 @@ impl ClipboardPeer {
         cancellation: CancellationToken,
         frame: ClipboardFrame,
     ) -> bool {
-        let ClipboardFrame::TextChunk { update_id, index, .. } = &frame else {
-            return false;
+        let (update_id, index) = match &frame {
+            ClipboardFrame::TextChunk {
+                update_id, index, ..
+            }
+            | ClipboardFrame::ImageChunk {
+                update_id, index, ..
+            } => (update_id, index),
+            _ => return false,
         };
         for _ in 0..MAX_RETRIES {
             if !self.is_current(generation) || cancellation.is_cancelled() {

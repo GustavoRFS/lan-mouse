@@ -1,7 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
-    clipboard::SharedClipboardReassembler,
+    clipboard::{ClipboardPayload, SharedClipboardReassembler},
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -9,12 +9,15 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
-use lan_mouse_proto::{ClipboardReassembler, ClipboardUpdateId, MAX_CLIPBOARD_TEXT_BYTES};
+use lan_mouse_proto::{
+    ClipboardReassembler, ClipboardUpdateId, MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
+};
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -113,11 +116,8 @@ impl Service {
             clipboard_reassembler.clone(),
         )
         .await?;
-        let conn = LanMouseConnection::new(
-            cert.clone(),
-            client_manager.clone(),
-            clipboard_reassembler,
-        );
+        let conn =
+            LanMouseConnection::new(cert.clone(), client_manager.clone(), clipboard_reassembler);
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -256,6 +256,9 @@ impl Service {
                 }
             }
             FrontendRequest::ClipboardText(text) => self.share_local_clipboard_text(text),
+            FrontendRequest::ClipboardImage(png_base64) => {
+                self.share_local_clipboard_image(png_base64)
+            }
         }
     }
 
@@ -376,13 +379,13 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
-            EmulationEvent::ClipboardText {
+            EmulationEvent::Clipboard {
                 addr,
                 update_id,
-                text,
+                payload,
             } => {
-                log::trace!("clipboard text received from {addr}");
-                self.apply_remote_clipboard_text(update_id, text);
+                log::trace!("clipboard update received from {addr}");
+                self.apply_remote_clipboard(update_id, payload);
             }
         }
     }
@@ -412,8 +415,8 @@ impl Service {
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
-            ICaptureEvent::ClipboardText { update_id, text } => {
-                self.apply_remote_clipboard_text(update_id, text);
+            ICaptureEvent::Clipboard { update_id, payload } => {
+                self.apply_remote_clipboard(update_id, payload);
             }
         }
     }
@@ -464,18 +467,46 @@ impl Service {
             log::debug!("ignoring oversized local clipboard text update");
             return;
         }
+        self.broadcast_local_clipboard(ClipboardPayload::Text(text));
+    }
+
+    fn share_local_clipboard_image(&mut self, png_base64: String) {
+        if !self.clipboard_sharing || png_base64.len() > MAX_CLIPBOARD_IMAGE_BYTES.div_ceil(3) * 4 {
+            return;
+        }
+        let Ok(png) = BASE64.decode(png_base64) else {
+            return;
+        };
+        if png.len() > MAX_CLIPBOARD_IMAGE_BYTES || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return;
+        }
+        self.broadcast_local_clipboard(ClipboardPayload::ImagePng(png));
+    }
+
+    fn broadcast_local_clipboard(&mut self, payload: ClipboardPayload) {
         self.clipboard_sequence = self.clipboard_sequence.wrapping_add(1).max(1);
         let mut update_id: ClipboardUpdateId = [0; 16];
         update_id[..8].copy_from_slice(&self.clipboard_origin);
         update_id[8..].copy_from_slice(&self.clipboard_sequence.to_be_bytes());
-        self.capture
-            .broadcast_clipboard_text(update_id, text.clone());
-        self.emulation.broadcast_clipboard_text(update_id, text);
+        self.capture.broadcast_clipboard(update_id, payload.clone());
+        self.emulation.broadcast_clipboard(update_id, payload);
     }
 
-    fn apply_remote_clipboard_text(&mut self, update_id: ClipboardUpdateId, text: String) {
-        if self.clipboard_sharing {
-            self.notify_frontend(FrontendEvent::ClipboardUpdate { update_id, text });
+    fn apply_remote_clipboard(&mut self, update_id: ClipboardUpdateId, payload: ClipboardPayload) {
+        if !self.clipboard_sharing {
+            return;
+        }
+        match payload {
+            ClipboardPayload::Text(text) => {
+                self.notify_frontend(FrontendEvent::ClipboardUpdate { update_id, text });
+            }
+            ClipboardPayload::ImagePng(png) if png.len() <= MAX_CLIPBOARD_IMAGE_BYTES => {
+                self.notify_frontend(FrontendEvent::ClipboardImageUpdate {
+                    update_id,
+                    png_base64: BASE64.encode(png),
+                });
+            }
+            ClipboardPayload::ImagePng(_) => {}
         }
     }
 

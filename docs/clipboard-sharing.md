@@ -2,7 +2,7 @@
 
 ## Goal
 
-Share clipboard content between Lan Mouse peers on Windows and Linux. The work is staged: the first implementation supports plain text; image data and file lists/content are follow-up stages.
+Share clipboard content between Lan Mouse peers on Windows and Linux. Plain text and native clipboard images are supported; file lists and contents are a separate stage.
 
 ## User behavior
 
@@ -12,13 +12,14 @@ Share clipboard content between Lan Mouse peers on Windows and Linux. The work i
 - Disabling sharing stops outgoing synchronization and prevents incoming updates from changing the local clipboard. It does not clear the current clipboard.
 - Clipboard content is sent only over the existing authenticated DTLS peer sessions. Peers that do not advertise clipboard protocol support are not sent clipboard payloads.
 - Clipboard text is UTF-8 and limited to 256 KiB per update. Only plain text is read; file URI lists are not flattened into text. Invalid, incomplete, duplicate, or oversized messages are ignored. A failure to send to one peer does not prevent delivery to other peers.
+- Native image copies are encoded as PNG and limited to 8 MiB per update. An image file copied in a file manager remains a file clipboard item, so it is reserved for the file stage. Images are sent only to peers that advertise image support.
 
 ## Architecture
 
 - The GTK frontend reads and writes the desktop clipboard through GDK. On Wayland, where a hidden GTK window may not receive clipboard offers, it also uses `wl-paste --watch` and reads text with `wl-paste` when GDK has no formats. This requires `wl-clipboard` and a compositor with the wlroots data-control protocol. It suppresses change notifications caused by applying a remote update.
 - The frontend and daemon communicate clipboard state through the existing local IPC. Text is bounded before it crosses that interface.
 - The daemon distributes local updates over its existing outgoing and incoming DTLS sessions. Incoming clipboard events are surfaced to the GTK frontend without forwarding them to other peers.
-- Clipboard wire messages use a separate, versioned variable-length frame format. The fixed-size `ProtoEvent` format remains for mouse and keyboard input. Clipboard frames are at most 1200 bytes, split into chunks, tagged with a 128-bit update ID, reassembled with a 256 KiB per-update and 4 MiB global memory cap, and acknowledged so lost chunks can be retried. At most 64 incomplete updates are held globally; incomplete transfers expire after 30 seconds, and newer updates from the same origin supersede older pending updates.
+- Clipboard wire messages use a separate, versioned variable-length frame format. The fixed-size `ProtoEvent` format remains for mouse and keyboard input. Clipboard frames are at most 1200 bytes, split into chunks, tagged with a 128-bit update ID, reassembled with a 256 KiB text or 8 MiB image per-update limit and 32 MiB global memory cap, and acknowledged so lost chunks can be retried. At most 64 incomplete updates are held globally; incomplete transfers expire after 30 seconds, and newer updates from the same origin supersede older pending updates.
 - A small capability message is exchanged after connection establishment. Older versions ignore the unknown capability message and never receive clipboard payload frames.
 - The same update ID is retained during retries and remembered in a 128-entry deduplication cache for 10 minutes. Applying a remote update does not emit a new local clipboard update, preventing echo loops.
 
@@ -28,4 +29,4 @@ Share clipboard content between Lan Mouse peers on Windows and Linux. The work i
 2. **Images:** identify and preserve the supported image MIME representation, transfer binary payloads using bounded chunks and checksums, and publish the received image to the local clipboard.
 3. **Files:** transfer clipboard file manifests and contents into temporary local storage, publish those staged files as native clipboard file items, and clean up expired or superseded transfers.
 
-Images and files are deliberately excluded from the text implementation plan because their clipboard formats and binary lifetime requirements differ from UTF-8 text. Their platform behavior and limits will be designed before those stages are implemented.
+Image and file clipboard formats and binary lifetime requirements differ from UTF-8 text. File transfer needs its own limits and cleanup behavior.

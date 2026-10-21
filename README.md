@@ -29,6 +29,10 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
 There are currently no mitigations in place for timing side-channel attacks.
 
+## Clipboard sharing in this fork
+
+Clipboard sharing is enabled by default and can be paused in the app. Text (up to 256 KiB) and native clipboard images (encoded PNG, up to 8 MiB) are sent to every connected, authenticated peer that supports the corresponding format. An image copied directly from a drawing app or browser is an image clipboard item; an image file copied in Explorer or Files is a file clipboard item and is handled separately. On wlroots Wayland desktops, hidden-window clipboard monitoring requires `wl-clipboard` (`wl-paste`).
+
 ## OS Support
 
 Most current desktop environments and operating systems are fully supported, this includes

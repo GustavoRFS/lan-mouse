@@ -14,6 +14,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
+use crate::clipboard::ClipboardPayload;
 use crate::connect::{LanMouseConnection, NetworkEvent};
 
 pub(crate) struct Capture {
@@ -44,9 +45,9 @@ pub(crate) enum ICaptureEvent {
     /// remote `Leave`, explicit `Release` request, send
     /// failure, or destroy of the active capture).
     ClientLeft(u64),
-    ClipboardText {
+    Clipboard {
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
     },
 }
 
@@ -72,9 +73,9 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
-    ClipboardText {
+    Clipboard {
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
     },
     CancelClipboardTransfers,
 }
@@ -154,13 +155,13 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 
-    pub(crate) fn broadcast_clipboard_text(
+    pub(crate) fn broadcast_clipboard(
         &self,
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
     ) {
         self.request_tx
-            .send(CaptureRequest::ClipboardText { update_id, text })
+            .send(CaptureRequest::Clipboard { update_id, payload })
             .expect("channel closed");
     }
 
@@ -246,16 +247,16 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
-                        CaptureRequest::ClipboardText { update_id, text } => {
-                            self.conn.broadcast_clipboard_text(update_id, text).await;
+                        CaptureRequest::Clipboard { update_id, payload } => {
+                            self.conn.broadcast_clipboard(update_id, payload).await;
                         }
                         CaptureRequest::CancelClipboardTransfers => {
                             self.conn.cancel_clipboard_transfers().await;
                         }
                     },
                     (handle, event) = self.conn.recv() => {
-                        if let NetworkEvent::ClipboardText { update_id, text } = event {
-                            self.event_tx.send(ICaptureEvent::ClipboardText { update_id, text }).expect("channel closed");
+                        if let NetworkEvent::Clipboard { update_id, payload } = event {
+                            self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
                         } else {
                             log::trace!("ignoring non-clipboard network event from {handle} while input capture is unavailable");
                         }
@@ -317,8 +318,8 @@ impl CaptureTask {
                 },
                 (handle, event) = self.conn.recv() => {
                     let event = match event {
-                        NetworkEvent::ClipboardText { update_id, text } => {
-                            self.event_tx.send(ICaptureEvent::ClipboardText { update_id, text }).expect("channel closed");
+                        NetworkEvent::Clipboard { update_id, payload } => {
+                            self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
                             continue;
                         }
                         NetworkEvent::Proto(event) => event,
@@ -369,8 +370,8 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    CaptureRequest::ClipboardText { update_id, text } => {
-                        self.conn.broadcast_clipboard_text(update_id, text).await;
+                    CaptureRequest::Clipboard { update_id, payload } => {
+                        self.conn.broadcast_clipboard(update_id, payload).await;
                     }
                     CaptureRequest::CancelClipboardTransfers => {
                         self.conn.cancel_clipboard_transfers().await;
