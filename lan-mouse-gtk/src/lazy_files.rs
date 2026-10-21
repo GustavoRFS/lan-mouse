@@ -21,6 +21,7 @@ use tempfile::TempDir;
 use crate::{file_offer, notify};
 
 const URI_LIST: &str = "text/uri-list";
+const PLAIN_TEXT: &str = "text/plain;charset=utf-8";
 const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
 
 glib::wrapper! {
@@ -206,7 +207,13 @@ mod imp {
 
     impl ContentProviderImpl for LazyFileProvider {
         fn formats(&self) -> gdk::ContentFormats {
+            // Clipboard watchers such as `wl-paste --type text --watch` read
+            // every new selection and take any text/* type, including the URI
+            // list, which would start the download as soon as files are
+            // copied. They prefer plain text, so it is offered first and only
+            // names the items; file managers still ask for the URI list.
             gdk::ContentFormatsBuilder::new()
+                .add_mime_type(PLAIN_TEXT)
                 .add_mime_type(URI_LIST)
                 .add_mime_type(GNOME_COPIED_FILES)
                 .add_mime_type(file_offer::OFFER_MARKER_MIME)
@@ -231,6 +238,7 @@ mod imp {
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect::<String>(),
+                    PLAIN_TEXT => offer.offer.names.join("\n"),
                     URI_LIST | GNOME_COPIED_FILES => {
                         let roots = offer.clone().roots().await.map_err(|m| failed(&m))?;
                         let uris = roots
