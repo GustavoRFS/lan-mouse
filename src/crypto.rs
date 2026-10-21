@@ -6,7 +6,6 @@ use std::{fs::File, io::BufReader};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webrtc_dtls::crypto::Certificate;
 
@@ -19,14 +18,7 @@ pub enum Error {
 }
 
 pub fn generate_fingerprint(cert: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(cert);
-    let bytes = hash
-        .finalize()
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect::<Vec<_>>();
-    bytes.join(":").to_lowercase()
+    lan_mouse_transfer::fingerprint(cert)
 }
 
 pub fn certificate_fingerprint(cert: &Certificate) -> String {

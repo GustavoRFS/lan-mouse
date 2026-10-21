@@ -7,23 +7,25 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    file_transfer::FileTransferServer,
     listen::{LanMouseListener, ListenerCreationError},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    IpcListenerCreationError, Position, RemoteFileOffer, Status,
 };
 use lan_mouse_proto::{
-    ClipboardReassembler, ClipboardUpdateId, MAX_CLIPBOARD_FILES_BYTES, MAX_CLIPBOARD_IMAGE_BYTES,
-    MAX_CLIPBOARD_TEXT_BYTES, decode_file_bundle,
+    ClipboardReassembler, ClipboardUpdateId, FileOfferAnnouncement, MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_TEXT_BYTES,
 };
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
@@ -74,6 +76,8 @@ pub struct Service {
     clipboard_origin: [u8; 8],
     /// monotonic per-process clipboard update sequence
     clipboard_sequence: u64,
+    /// serves files copied on this device to peers that paste them
+    file_transfer: FileTransferServer,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
@@ -119,6 +123,7 @@ impl Service {
         .await?;
         let conn =
             LanMouseConnection::new(cert.clone(), client_manager.clone(), clipboard_reassembler);
+        let file_transfer = FileTransferServer::new(&cert, config.port());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -150,6 +155,7 @@ impl Service {
             clipboard_sharing,
             clipboard_origin,
             clipboard_sequence: 0,
+            file_transfer,
         };
         Ok(service)
     }
@@ -186,6 +192,7 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        self.file_transfer.terminate();
 
         Ok(())
     }
@@ -251,6 +258,7 @@ impl Service {
                     if !enabled {
                         self.capture.cancel_clipboard_transfers();
                         self.emulation.cancel_clipboard_transfers();
+                        self.file_transfer.withdraw();
                     }
                     self.save_config();
                     self.notify_frontend(FrontendEvent::ClipboardSharing(enabled));
@@ -260,9 +268,7 @@ impl Service {
             FrontendRequest::ClipboardImage(png_base64) => {
                 self.share_local_clipboard_image(png_base64)
             }
-            FrontendRequest::ClipboardFiles(bundle_base64) => {
-                self.share_local_clipboard_files(bundle_base64)
-            }
+            FrontendRequest::ClipboardFiles(paths) => self.share_local_clipboard_files(paths),
         }
     }
 
@@ -309,6 +315,7 @@ impl Service {
         if self.clipboard_sharing && !clipboard_sharing {
             self.capture.cancel_clipboard_transfers();
             self.emulation.cancel_clipboard_transfers();
+            self.file_transfer.withdraw();
         }
         self.clipboard_sharing = clipboard_sharing;
         let authorized_keys = self.config.authorized_fingerprints();
@@ -355,6 +362,7 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    self.file_transfer.listen(port);
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -471,6 +479,7 @@ impl Service {
             log::debug!("ignoring oversized local clipboard text update");
             return;
         }
+        self.file_transfer.withdraw();
         self.broadcast_local_clipboard(ClipboardPayload::Text(text));
     }
 
@@ -488,22 +497,23 @@ impl Service {
         if png.len() > MAX_CLIPBOARD_IMAGE_BYTES || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
             return;
         }
+        self.file_transfer.withdraw();
         self.broadcast_local_clipboard(ClipboardPayload::ImagePng(png));
     }
 
-    fn share_local_clipboard_files(&mut self, bundle_base64: String) {
-        if !self.clipboard_sharing
-            || bundle_base64.len() > MAX_CLIPBOARD_FILES_BYTES.div_ceil(3) * 4
-        {
+    fn share_local_clipboard_files(&mut self, paths: Vec<PathBuf>) {
+        if !self.clipboard_sharing || paths.is_empty() {
             return;
         }
-        let Ok(bundle) = BASE64.decode(bundle_base64) else {
+        log::debug!("frontend shared {} copied files", paths.len());
+        let Some(announcement) = self.file_transfer.offer(paths) else {
+            log::warn!("copied files are not shared: the file transfer listener is not running");
             return;
         };
-        if decode_file_bundle(&bundle).is_err() {
-            return;
-        }
-        self.broadcast_local_clipboard(ClipboardPayload::Files(bundle));
+        self.broadcast_local_clipboard(ClipboardPayload::FileOffer {
+            announcement: announcement.encode(),
+            source: None,
+        });
     }
 
     fn broadcast_local_clipboard(&mut self, payload: ClipboardPayload) {
@@ -519,6 +529,8 @@ impl Service {
         if !self.clipboard_sharing {
             return;
         }
+        // the local clipboard is replaced, so files copied here are gone from it
+        self.file_transfer.withdraw();
         match payload {
             ClipboardPayload::Text(text) => {
                 self.notify_frontend(FrontendEvent::ClipboardUpdate { update_id, text });
@@ -530,16 +542,31 @@ impl Service {
                 });
             }
             ClipboardPayload::ImagePng(_) => {}
-            ClipboardPayload::Files(bundle)
-                if bundle.len() <= MAX_CLIPBOARD_FILES_BYTES
-                    && decode_file_bundle(&bundle).is_ok() =>
-            {
-                self.notify_frontend(FrontendEvent::ClipboardFilesUpdate {
+            ClipboardPayload::FileOffer {
+                announcement,
+                source: Some(source),
+            } => {
+                let Ok(announcement) = FileOfferAnnouncement::decode(&announcement) else {
+                    return;
+                };
+                log::debug!(
+                    "peer {} offers {} copied items",
+                    source.ip,
+                    announcement.item_count
+                );
+                self.notify_frontend(FrontendEvent::ClipboardFileOffer {
                     update_id,
-                    bundle_base64: BASE64.encode(bundle),
+                    offer: RemoteFileOffer {
+                        host: source.ip.to_string(),
+                        addr: SocketAddr::new(source.ip, announcement.port),
+                        fingerprint: source.fingerprint,
+                        token: announcement.token,
+                        item_count: announcement.item_count,
+                        names: announcement.names,
+                    },
                 });
             }
-            ClipboardPayload::Files(_) => {}
+            ClipboardPayload::FileOffer { source: None, .. } => {}
         }
     }
 

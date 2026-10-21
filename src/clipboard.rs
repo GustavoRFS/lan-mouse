@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,14 +11,17 @@ use std::{
 use futures::future::join_all;
 use lan_mouse_proto::{
     ClipboardFrame, ClipboardReassembler, ClipboardReassemblyResult, ClipboardUpdateId,
-    ProtocolError, chunk_files, chunk_image, chunk_text,
+    ProtocolError, chunk_file_offer, chunk_image, chunk_text,
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+use webrtc_dtls::conn::DTLSConn;
 use webrtc_util::Conn;
+
+use crate::crypto;
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 pub(crate) type SharedClipboardReassembler = Arc<Mutex<ClipboardReassembler>>;
@@ -26,7 +30,20 @@ pub(crate) type SharedClipboardReassembler = Arc<Mutex<ClipboardReassembler>>;
 pub(crate) enum ClipboardPayload {
     Text(String),
     ImagePng(Vec<u8>),
-    Files(Vec<u8>),
+    /// Encoded [`lan_mouse_proto::FileOfferAnnouncement`].
+    FileOffer {
+        announcement: Vec<u8>,
+        /// The peer that sent the offer; `None` for an offer made here.
+        source: Option<OfferSource>,
+    },
+}
+
+/// Identity of the session an offer arrived on, used to reach the peer for
+/// the file contents and to authenticate it there.
+#[derive(Clone, Debug)]
+pub(crate) struct OfferSource {
+    pub(crate) ip: IpAddr,
+    pub(crate) fingerprint: String,
 }
 
 impl std::fmt::Debug for ClipboardPayload {
@@ -34,7 +51,10 @@ impl std::fmt::Debug for ClipboardPayload {
         match self {
             Self::Text(text) => formatter.debug_tuple("Text").field(&text.len()).finish(),
             Self::ImagePng(png) => formatter.debug_tuple("ImagePng").field(&png.len()).finish(),
-            Self::Files(bundle) => formatter.debug_tuple("Files").field(&bundle.len()).finish(),
+            Self::FileOffer { source, .. } => formatter
+                .debug_struct("FileOffer")
+                .field("source", source)
+                .finish(),
         }
     }
 }
@@ -48,7 +68,7 @@ const CAPABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 struct PeerState {
     supports_clipboard: bool,
     supports_image: bool,
-    supports_files: bool,
+    supports_file_offers: bool,
     chunk_acks: HashMap<(ClipboardUpdateId, u16), oneshot::Sender<()>>,
     update_acks: HashMap<ClipboardUpdateId, oneshot::Sender<bool>>,
     transfer_cancel: CancellationToken,
@@ -59,7 +79,7 @@ impl Default for PeerState {
         Self {
             supports_clipboard: false,
             supports_image: false,
-            supports_files: false,
+            supports_file_offers: false,
             chunk_acks: HashMap::new(),
             update_acks: HashMap::new(),
             transfer_cancel: CancellationToken::new(),
@@ -94,7 +114,7 @@ impl ClipboardPeer {
         if let Err(error) = self.send_frame(ClipboardFrame::ImageCapabilities).await {
             log::debug!("could not advertise image clipboard support: {error}");
         }
-        if let Err(error) = self.send_frame(ClipboardFrame::FileCapabilities).await {
+        if let Err(error) = self.send_frame(ClipboardFrame::FileOfferCapabilities).await {
             log::debug!("could not advertise file clipboard support: {error}");
         }
     }
@@ -121,15 +141,39 @@ impl ClipboardPeer {
         self.send_frames(update_id, frames, true, false).await;
     }
 
-    pub(crate) async fn send_files(&self, update_id: ClipboardUpdateId, bundle: &[u8]) {
-        let frames = match chunk_files(update_id, bundle) {
+    pub(crate) async fn send_file_offer(&self, update_id: ClipboardUpdateId, announcement: &[u8]) {
+        let frames = match chunk_file_offer(update_id, announcement) {
             Ok(frames) => frames,
             Err(error) => {
-                log::debug!("clipboard files could not be chunked: {error}");
+                log::debug!("clipboard file offer could not be chunked: {error}");
                 return;
             }
         };
         self.send_frames(update_id, frames, false, true).await;
+    }
+
+    /// Sends `payload` to this peer. Offers received from a peer are never
+    /// passed on.
+    pub(crate) async fn send(&self, update_id: ClipboardUpdateId, payload: &ClipboardPayload) {
+        match payload {
+            ClipboardPayload::Text(text) => self.send_text(update_id, text).await,
+            ClipboardPayload::ImagePng(png) => self.send_image(update_id, png).await,
+            ClipboardPayload::FileOffer {
+                announcement,
+                source: None,
+            } => self.send_file_offer(update_id, announcement).await,
+            ClipboardPayload::FileOffer {
+                source: Some(_), ..
+            } => {}
+        }
+    }
+
+    async fn offer_source(&self) -> Option<OfferSource> {
+        let ip = self.conn.remote_addr()?.ip();
+        let dtls: &DTLSConn = self.conn.as_any().downcast_ref()?;
+        let certificates = dtls.connection_state().await.peer_certificates;
+        let fingerprint = crypto::generate_fingerprint(certificates.first()?);
+        Some(OfferSource { ip, fingerprint })
     }
 
     async fn send_frames(
@@ -227,7 +271,7 @@ impl ClipboardPeer {
         self.reassembler.lock().await.expire();
         let frame = ClipboardFrame::decode(data)?;
         let image = matches!(frame, ClipboardFrame::ImageChunk { .. });
-        let files = matches!(frame, ClipboardFrame::FileChunk { .. });
+        let files = matches!(frame, ClipboardFrame::FileOfferChunk { .. });
         match frame {
             ClipboardFrame::Capabilities => {
                 self.mark_supported().await;
@@ -243,13 +287,13 @@ impl ClipboardPeer {
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
             }
             ClipboardFrame::ImageCapabilitiesAck => self.mark_image_supported().await,
-            ClipboardFrame::FileCapabilities => {
-                self.mark_files_supported().await;
-                self.send_frame(ClipboardFrame::FileCapabilitiesAck)
+            ClipboardFrame::FileOfferCapabilities => {
+                self.mark_file_offers_supported().await;
+                self.send_frame(ClipboardFrame::FileOfferCapabilitiesAck)
                     .await
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
             }
-            ClipboardFrame::FileCapabilitiesAck => self.mark_files_supported().await,
+            ClipboardFrame::FileOfferCapabilitiesAck => self.mark_file_offers_supported().await,
             ClipboardFrame::TextChunk {
                 update_id,
                 index,
@@ -266,7 +310,7 @@ impl ClipboardPeer {
                 checksum,
                 payload,
             }
-            | ClipboardFrame::FileChunk {
+            | ClipboardFrame::FileOfferChunk {
                 update_id,
                 index,
                 count,
@@ -278,7 +322,7 @@ impl ClipboardPeer {
                     return Err(ProtocolError::InvalidClipboardFrame);
                 }
                 let result = if files {
-                    self.reassembler.lock().await.push_files(
+                    self.reassembler.lock().await.push_file_offer(
                         update_id,
                         index,
                         count,
@@ -339,14 +383,24 @@ impl ClipboardPeer {
                             .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
                         return Ok(Some((update_id, ClipboardPayload::ImagePng(png))));
                     }
-                    Ok(ClipboardReassemblyResult::CompleteFiles(bundle)) => {
+                    Ok(ClipboardReassemblyResult::CompleteFileOffer(announcement)) => {
                         self.send_frame(ClipboardFrame::TextChunkAck { update_id, index })
                             .await
                             .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
                         self.send_frame(ClipboardFrame::TextUpdateAck(update_id))
                             .await
                             .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
-                        return Ok(Some((update_id, ClipboardPayload::Files(bundle))));
+                        let Some(source) = self.offer_source().await else {
+                            log::warn!("ignoring file offer from a peer without certificate");
+                            return Ok(None);
+                        };
+                        return Ok(Some((
+                            update_id,
+                            ClipboardPayload::FileOffer {
+                                announcement,
+                                source: Some(source),
+                            },
+                        )));
                     }
                     Err(error) => {
                         let _ = self
@@ -416,7 +470,7 @@ impl ClipboardPeer {
                 result = timeout(remaining.min(Duration::from_millis(500)), notified) => {
                     if result.is_err() {
                         let capability = if files {
-                            ClipboardFrame::FileCapabilities
+                            ClipboardFrame::FileOfferCapabilities
                         } else if image {
                             ClipboardFrame::ImageCapabilities
                         } else {
@@ -439,13 +493,13 @@ impl ClipboardPeer {
         self.state.lock().await.supports_image
     }
 
-    async fn supports_files(&self) -> bool {
-        self.state.lock().await.supports_files
+    async fn supports_file_offers(&self) -> bool {
+        self.state.lock().await.supports_file_offers
     }
 
     async fn supports_kind(&self, image: bool, files: bool) -> bool {
         if files {
-            self.supports_files().await
+            self.supports_file_offers().await
         } else if image {
             self.supports_image().await
         } else {
@@ -463,8 +517,8 @@ impl ClipboardPeer {
         self.ready.notify_waiters();
     }
 
-    async fn mark_files_supported(&self) {
-        self.state.lock().await.supports_files = true;
+    async fn mark_file_offers_supported(&self) {
+        self.state.lock().await.supports_file_offers = true;
         self.ready.notify_waiters();
     }
 
@@ -481,7 +535,7 @@ impl ClipboardPeer {
             | ClipboardFrame::ImageChunk {
                 update_id, index, ..
             }
-            | ClipboardFrame::FileChunk {
+            | ClipboardFrame::FileOfferChunk {
                 update_id, index, ..
             } => (update_id, index),
             _ => return false,

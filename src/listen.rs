@@ -251,13 +251,7 @@ impl LanMouseListener {
             .collect::<Vec<_>>();
         for peer in peers {
             let payload = payload.clone();
-            spawn_local(async move {
-                match payload {
-                    ClipboardPayload::Text(text) => peer.send_text(update_id, &text).await,
-                    ClipboardPayload::ImagePng(png) => peer.send_image(update_id, &png).await,
-                    ClipboardPayload::Files(bundle) => peer.send_files(update_id, &bundle).await,
-                }
-            });
+            spawn_local(async move { peer.send(update_id, &payload).await });
         }
     }
 

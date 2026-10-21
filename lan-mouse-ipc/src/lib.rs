@@ -4,15 +4,13 @@ use std::{
     fmt::Display,
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
 };
 use thiserror::Error;
 
 #[cfg(unix)]
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::{env, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -235,11 +233,30 @@ pub enum FrontendEvent {
         update_id: [u8; 16],
         png_base64: String,
     },
-    /// Native file clipboard update received from an authenticated peer.
-    ClipboardFilesUpdate {
+    /// Files or folders copied on an authenticated peer, fetched on paste.
+    ClipboardFileOffer {
         update_id: [u8; 16],
-        bundle_base64: String,
+        offer: RemoteFileOffer,
     },
+}
+
+/// Files or folders copied on a peer. Their content stays on the peer until
+/// it is pasted here and is then fetched over TLS on TCP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteFileOffer {
+    /// Peer address as shown to the user.
+    pub host: String,
+    /// TCP endpoint serving the offer.
+    pub addr: SocketAddr,
+    /// Certificate fingerprint of the peer's authenticated DTLS session; the
+    /// TLS server has to present the same certificate.
+    pub fingerprint: String,
+    /// Secret that authorizes fetching this offer.
+    pub token: [u8; 32],
+    /// Number of copied items.
+    pub item_count: u32,
+    /// Names of the copied items; may be fewer than `item_count`.
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -286,8 +303,8 @@ pub enum FrontendRequest {
     ClipboardText(String),
     /// Base64-encoded PNG copied on this device.
     ClipboardImage(String),
-    /// Base64-encoded file bundle copied on this device.
-    ClipboardFiles(String),
+    /// Files or folders copied on this device. Peers fetch them on paste.
+    ClipboardFiles(Vec<PathBuf>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

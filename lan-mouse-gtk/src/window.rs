@@ -422,8 +422,8 @@ impl Window {
         self.request(FrontendRequest::ClipboardImage(png_base64));
     }
 
-    pub(super) fn send_clipboard_files(&self, bundle_base64: String) {
-        self.request(FrontendRequest::ClipboardFiles(bundle_base64));
+    pub(super) fn send_clipboard_files(&self, paths: Vec<std::path::PathBuf>) {
+        self.request(FrontendRequest::ClipboardFiles(paths));
     }
 
     pub(super) fn set_clipboard_sharing(&self, enabled: bool) {

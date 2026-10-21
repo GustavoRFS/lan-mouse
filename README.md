@@ -31,7 +31,7 @@ There are currently no mitigations in place for timing side-channel attacks.
 
 ## Clipboard sharing in this fork
 
-Clipboard sharing is enabled by default and can be paused in the app. Text (up to 256 KiB) and native clipboard images (encoded PNG, up to 8 MiB) are sent to every connected, authenticated peer that supports the corresponding format. An image copied directly from a drawing app or browser is an image clipboard item; an image file copied in Explorer or Files is a file clipboard item and is handled separately. On wlroots Wayland desktops, hidden-window clipboard monitoring requires `wl-clipboard` (`wl-paste`).
+Clipboard sharing is enabled by default and can be paused in the app. Text (up to 256 KiB) and native clipboard images (encoded PNG, up to 8 MiB) are sent to every connected, authenticated peer that supports the corresponding format. An image copied directly from a drawing app or browser is an image clipboard item; an image file copied in Explorer or Files is a file clipboard item. Copied files and folders have no size limit and are transferred only when pasted, over TLS on TCP using the Lan Mouse port (4242 by default), so the firewall of every device has to allow TCP on that port as well. On Windows they paste in Explorer, which shows its own progress; apps that only accept file paths, such as browsers, cannot paste them. On Linux the paste waits until the files are downloaded. On wlroots Wayland desktops, hidden-window clipboard monitoring requires `wl-clipboard` (`wl-paste`).
 
 ## OS Support
 
@@ -330,9 +330,9 @@ provides `Open Lan Mouse` and `Quit`. On macOS the frontend opens normally and
 remains available from the menu bar item.
 
 Clipboard sharing is enabled by default and can be paused from the General
-section. The first stage synchronizes plain text up to 256 KiB between directly
-connected devices on Windows and Linux. Image and file clipboard transfer are
-planned follow-up stages.
+section. Text, images, and copied files and folders are shared between directly
+connected devices on Windows and Linux, see [Clipboard sharing in this
+fork](#clipboard-sharing-in-this-fork).
 On wlroots Wayland desktops, install `wl-clipboard` so sharing continues while
 the Lan Mouse window is hidden in the tray.
 
@@ -460,7 +460,7 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [ ] Bandwidth usage measurement and visualization
 - [x] Clipboard text sharing (Windows and Linux)
 - [ ] Clipboard image sharing
-- [ ] Clipboard file sharing
+- [x] Clipboard file sharing
 
 
 ## Detailed OS Support

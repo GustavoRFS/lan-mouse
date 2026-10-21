@@ -2,18 +2,23 @@ mod authorization_window;
 mod client_object;
 mod client_row;
 mod clipboard;
+mod file_offer;
 mod fingerprint_window;
 mod key_object;
 mod key_row;
+mod lazy_files;
 #[cfg(target_os = "linux")]
 mod linux_tray;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+mod notify;
 mod window;
 #[cfg(windows)]
 mod windows_clipboard;
+#[cfg(windows)]
+mod windows_file_offer;
 #[cfg(windows)]
 mod windows_tray;
 
@@ -350,11 +355,8 @@ fn build_ui(app: &Application) {
                     } => {
                         clipboard_sync.apply_remote_image(update_id, png_base64);
                     }
-                    FrontendEvent::ClipboardFilesUpdate {
-                        update_id,
-                        bundle_base64,
-                    } => {
-                        clipboard_sync.apply_remote_files(update_id, bundle_base64);
+                    FrontendEvent::ClipboardFileOffer { update_id, offer } => {
+                        clipboard_sync.apply_remote_file_offer(update_id, offer);
                     }
                 }
             }
