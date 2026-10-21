@@ -167,6 +167,7 @@ impl LanMouseConnection {
                 match payload {
                     ClipboardPayload::Text(text) => peer.send_text(update_id, &text).await,
                     ClipboardPayload::ImagePng(png) => peer.send_image(update_id, &png).await,
+                    ClipboardPayload::Files(bundle) => peer.send_files(update_id, &bundle).await,
                 }
             });
         }
@@ -233,6 +234,7 @@ impl LanMouseConnection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
@@ -334,6 +336,7 @@ async fn ping_pong(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
