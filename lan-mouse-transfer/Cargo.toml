@@ -1,0 +1,20 @@
+[package]
+name = "lan-mouse-transfer"
+description = "On-demand clipboard file transfer between lan-mouse peers"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/feschber/lan-mouse"
+
+[dependencies]
+log = "0.4.20"
+rustls = { version = "0.23.12", default-features = false, features = [
+    "std",
+    "ring",
+] }
+sha2 = "0.10.8"
+thiserror = "2.0.0"
+
+[dev-dependencies]
+rcgen = "0.13.1"
+tempfile = "3.10.1"

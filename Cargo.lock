@@ -1791,6 +1791,7 @@ dependencies = [
  "lan-mouse-gtk",
  "lan-mouse-ipc",
  "lan-mouse-proto",
+ "lan-mouse-transfer",
  "libc",
  "local-channel",
  "log",
@@ -1836,12 +1837,15 @@ dependencies = [
  "ksni",
  "lan-mouse-ipc",
  "lan-mouse-proto",
+ "lan-mouse-transfer",
  "libadwaita",
  "log",
+ "rcgen",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "windows",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -1865,6 +1869,18 @@ dependencies = [
  "num_enum",
  "paste",
  "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lan-mouse-transfer"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

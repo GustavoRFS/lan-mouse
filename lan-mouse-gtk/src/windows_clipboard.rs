@@ -1,10 +1,4 @@
-use std::{
-    ffi::OsString,
-    mem::{size_of, size_of_val},
-    os::windows::ffi::{OsStrExt, OsStringExt},
-    path::PathBuf,
-    ptr,
-};
+use std::{ffi::OsString, mem::size_of, os::windows::ffi::OsStringExt, path::PathBuf, ptr};
 
 use gtk::{gdk, prelude::*};
 use windows::{
@@ -18,9 +12,9 @@ use windows::{
             },
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
         },
-        UI::Shell::{DROPFILES, DragQueryFileW, HDROP},
+        UI::Shell::{DragQueryFileW, HDROP},
     },
-    core::{BOOL, w},
+    core::w,
 };
 
 use crate::windows_tray;
@@ -29,7 +23,6 @@ const CF_HDROP: u32 = 15;
 const CF_DIBV5: u32 = 17;
 const LCS_SRGB: u32 = 0x7352_4742;
 const LCS_GM_IMAGES: u32 = 4;
-const MAX_FILES: u32 = 16;
 const MAX_DIB_BYTES: usize = 256 * 1024 * 1024;
 
 struct ClipboardGuard;
@@ -50,7 +43,7 @@ pub(crate) fn copied_file_paths() -> Option<Vec<PathBuf>> {
         let handle = GetClipboardData(CF_HDROP).ok()?;
         let drop = HDROP(handle.0);
         let count = DragQueryFileW(drop, u32::MAX, None);
-        if count == 0 || count > MAX_FILES {
+        if count == 0 {
             return None;
         }
         let mut paths = Vec::with_capacity(count as usize);
@@ -67,27 +60,6 @@ pub(crate) fn copied_file_paths() -> Option<Vec<PathBuf>> {
         }
         Some(paths)
     }
-}
-
-pub(crate) fn publish_file_paths(paths: &[PathBuf]) -> bool {
-    if paths.is_empty() || paths.len() > MAX_FILES as usize {
-        return false;
-    }
-    let mut names = Vec::<u16>::new();
-    for path in paths {
-        names.extend(path.as_os_str().encode_wide());
-        names.push(0);
-    }
-    names.push(0);
-    let header = DROPFILES {
-        pFiles: size_of::<DROPFILES>() as u32,
-        fWide: BOOL(1),
-        ..Default::default()
-    };
-    let Some(memory) = global_from_parts(&[struct_bytes(&header), wide_bytes(&names)]) else {
-        return false;
-    };
-    publish(&mut [(CF_HDROP, Some(memory))])
 }
 
 /// Publishes an image both as the registered "PNG" format (Chromium/Electron,
@@ -197,7 +169,7 @@ fn dib_v5(texture: &gdk::Texture) -> Option<(BITMAPV5HEADER, Vec<u8>)> {
     Some((header, pixels))
 }
 
-fn global_from_parts(parts: &[&[u8]]) -> Option<HGLOBAL> {
+pub(crate) fn global_from_parts(parts: &[&[u8]]) -> Option<HGLOBAL> {
     let byte_count = parts.iter().map(|part| part.len()).sum::<usize>();
     unsafe {
         let memory = GlobalAlloc(GMEM_MOVEABLE, byte_count).ok()?;
@@ -216,10 +188,6 @@ fn global_from_parts(parts: &[&[u8]]) -> Option<HGLOBAL> {
     }
 }
 
-fn struct_bytes<T: Copy>(value: &T) -> &[u8] {
+pub(crate) fn struct_bytes<T: Copy>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
-}
-
-fn wide_bytes(value: &[u16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(value.as_ptr() as *const u8, size_of_val(value)) }
 }

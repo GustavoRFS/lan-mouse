@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 use std::mem;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -9,7 +11,8 @@ use crate::window::Window;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetCursorPos,
@@ -34,8 +37,48 @@ thread_local! {
     static TRAY_STATE: RefCell<Option<TrayState>> = const { RefCell::new(None) };
 }
 
+/// Tray window for notifications, which may be raised from any thread.
+static TRAY_HWND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+
 pub(crate) fn clipboard_owner_hwnd() -> Option<HWND> {
     TRAY_STATE.with(|state| state.borrow().as_ref().map(|state| state.hwnd))
+}
+
+/// Shows a notification from the tray icon.
+pub(crate) fn notify(title: &str, message: &str, error: bool) {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = mem::zeroed();
+        nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = HWND(hwnd);
+        nid.uID = 1;
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = if error { NIIF_ERROR } else { NIIF_INFO };
+        copy_truncated(&mut nid.szInfoTitle, title);
+        copy_truncated(&mut nid.szInfo, message);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+/// Copies `text` as a terminated UTF-16 string, cut with an ellipsis if needed.
+fn copy_truncated(target: &mut [u16], text: &str) {
+    let max = target.len() - 1;
+    let mut wide = text.encode_utf16().collect::<Vec<_>>();
+    if wide.len() > max {
+        wide.truncate(max - 1);
+        if wide
+            .last()
+            .is_some_and(|unit| (0xD800..0xDC00).contains(unit))
+        {
+            wide.pop();
+        }
+        wide.push('…' as u16);
+    }
+    target[..wide.len()].copy_from_slice(&wide);
+    target[wide.len()] = 0;
 }
 
 pub fn setup(app: &adw::Application, window: &Window) {
@@ -83,6 +126,7 @@ pub fn setup(app: &adw::Application, window: &Window) {
         nid.szTip[..tip.len()].copy_from_slice(&tip);
 
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        TRAY_HWND.store(hwnd.0, Ordering::SeqCst);
 
         TRAY_STATE.with(|state| {
             *state.borrow_mut() = Some(TrayState {
@@ -111,6 +155,7 @@ fn quit_app() {
     TRAY_STATE.with(|state| {
         let state = state.borrow();
         if let Some(state) = state.as_ref() {
+            TRAY_HWND.store(ptr::null_mut(), Ordering::SeqCst);
             unsafe {
                 let mut nid: NOTIFYICONDATAW = mem::zeroed();
                 nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
