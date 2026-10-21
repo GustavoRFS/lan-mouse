@@ -100,7 +100,23 @@ fn main() {
     // init logging
     let default_level = if debug_requested() { "debug" } else { "info" };
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", default_level);
-    env_logger::init_from_env(env);
+    let mut logger = env_logger::Builder::from_env(env);
+    // LAN_MOUSE_LOG_FILE appends the log to a file, e.g. on Windows where the
+    // GUI binary has no console unless `--debug` opens one. The daemon inherits
+    // the variable and appends to the same file.
+    if let Some(path) = std::env::var_os("LAN_MOUSE_LOG_FILE") {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                logger.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => eprintln!("could not open log file {}: {e}", path.display()),
+        }
+    }
+    logger.init();
 
     if let Err(e) = run() {
         log::error!("{e}");
