@@ -38,7 +38,6 @@ impl FrontendEventReader {
 impl FrontendRequestWriter {
     pub fn request(&mut self, request: FrontendRequest) -> Result<(), io::Error> {
         let mut json = serde_json::to_string(&request).unwrap();
-        log::debug!("requesting: {json}");
         json.push('\n');
         self.line_writer.write_all(json.as_bytes())?;
         Ok(())

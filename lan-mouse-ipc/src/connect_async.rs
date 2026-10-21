@@ -48,7 +48,6 @@ impl Stream for AsyncFrontendEventReader {
 impl AsyncFrontendRequestWriter {
     pub async fn request(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
         let mut json = serde_json::to_string(&request).unwrap();
-        log::debug!("requesting: {json}");
         json.push('\n');
         self.tx.write_all(json.as_bytes()).await?;
         Ok(())

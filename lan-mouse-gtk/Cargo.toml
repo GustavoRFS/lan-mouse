@@ -7,11 +7,13 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/feschber/lan-mouse"
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.9.0", features = ["v4_2"] }
+gtk = { package = "gtk4", version = "0.9.0", features = ["v4_8"] }
 adw = { package = "libadwaita", version = "0.7.0", features = ["v1_1"] }
 async-channel = { version = "2.1.1" }
 hostname = "0.4.0"
 log = "0.4.20"
+base64 = "0.22.1"
+sha2 = "0.10.8"
 lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.4.0" }
 lan-mouse-proto = { path = "../lan-mouse-proto", version = "0.4.0" }
 thiserror = "2.0.0"

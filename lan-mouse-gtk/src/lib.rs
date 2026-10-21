@@ -5,12 +5,12 @@ mod clipboard;
 mod fingerprint_window;
 mod key_object;
 mod key_row;
+#[cfg(target_os = "linux")]
+mod linux_tray;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
-#[cfg(target_os = "linux")]
-mod linux_tray;
 mod window;
 #[cfg(windows)]
 mod windows_tray;
@@ -44,8 +44,8 @@ use gtk::{IconTheme, gdk::Display, glib::clone, prelude::*};
 use gtk::{gio, glib, prelude::ApplicationExt};
 
 use self::client_object::ClientObject;
-use self::key_object::KeyObject;
 use self::clipboard::ClipboardSync;
+use self::key_object::KeyObject;
 
 use thiserror::Error;
 
@@ -341,6 +341,12 @@ fn build_ui(app: &Application) {
                     }
                     FrontendEvent::ClipboardUpdate { update_id, text } => {
                         clipboard_sync.apply_remote_text(update_id, text);
+                    }
+                    FrontendEvent::ClipboardImageUpdate {
+                        update_id,
+                        png_base64,
+                    } => {
+                        clipboard_sync.apply_remote_image(update_id, png_base64);
                     }
                 }
             }

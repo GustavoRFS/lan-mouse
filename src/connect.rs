@@ -1,8 +1,8 @@
+use crate::config::local_commit;
 use crate::{
     client::ClientManager,
-    clipboard::{ClipboardPeer, SharedClipboardReassembler},
+    clipboard::{ClipboardPayload, ClipboardPeer, SharedClipboardReassembler},
 };
-use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
     ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
@@ -57,9 +57,9 @@ struct ClientConnection {
 
 pub(crate) enum NetworkEvent {
     Proto(ProtoEvent),
-    ClipboardText {
+    Clipboard {
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
     },
 }
 
@@ -146,10 +146,10 @@ impl LanMouseConnection {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
-    pub(crate) async fn broadcast_clipboard_text(
+    pub(crate) async fn broadcast_clipboard(
         &self,
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
     ) {
         let mut peers = Vec::new();
         for handle in self.client_manager.active_clients() {
@@ -162,9 +162,12 @@ impl LanMouseConnection {
         }
 
         for peer in peers {
-            let text = text.clone();
+            let payload = payload.clone();
             spawn_local(async move {
-                peer.send_text(update_id, &text).await;
+                match payload {
+                    ClipboardPayload::Text(text) => peer.send_text(update_id, &text).await,
+                    ClipboardPayload::ImagePng(png) => peer.send_image(update_id, &png).await,
+                }
             });
         }
     }
@@ -349,8 +352,8 @@ async fn receive_loop(
         };
         if ClipboardFrame::is_clipboard_frame(&buf[..len]) {
             match clipboard.handle_frame(&buf[..len]).await {
-                Ok(Some((update_id, text))) => {
-                    tx.send((handle, NetworkEvent::ClipboardText { update_id, text }))
+                Ok(Some((update_id, payload))) => {
+                    tx.send((handle, NetworkEvent::Clipboard { update_id, payload }))
                         .expect("channel closed");
                 }
                 Ok(None) => {}

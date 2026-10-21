@@ -229,9 +229,11 @@ pub enum FrontendEvent {
     /// persisted clipboard sharing preference
     ClipboardSharing(bool),
     /// text clipboard update received from an authenticated peer
-    ClipboardUpdate {
+    ClipboardUpdate { update_id: [u8; 16], text: String },
+    /// PNG clipboard update received from an authenticated peer.
+    ClipboardImageUpdate {
         update_id: [u8; 16],
-        text: String,
+        png_base64: String,
     },
 }
 
@@ -277,6 +279,8 @@ pub enum FrontendRequest {
     SetClipboardSharing(bool),
     /// publish a locally changed plain-text clipboard value
     ClipboardText(String),
+    /// Base64-encoded PNG copied on this device.
+    ClipboardImage(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

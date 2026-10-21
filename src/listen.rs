@@ -25,7 +25,7 @@ use webrtc_dtls::{
 use webrtc_util::{Conn, Error, conn::Listener};
 
 use crate::{
-    clipboard::{ClipboardPeer, SharedClipboardReassembler},
+    clipboard::{ClipboardPayload, ClipboardPeer, SharedClipboardReassembler},
     crypto,
 };
 
@@ -44,9 +44,9 @@ pub(crate) enum ListenEvent {
         event: ProtoEvent,
         addr: SocketAddr,
     },
-    ClipboardText {
+    Clipboard {
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
         addr: SocketAddr,
     },
     Accept {
@@ -237,10 +237,10 @@ impl LanMouseListener {
         }
     }
 
-    pub(crate) async fn broadcast_clipboard_text(
+    pub(crate) async fn broadcast_clipboard(
         &self,
         update_id: ClipboardUpdateId,
-        text: String,
+        payload: ClipboardPayload,
     ) {
         let peers = self
             .conns
@@ -250,9 +250,12 @@ impl LanMouseListener {
             .map(|connection| connection.clipboard.clone())
             .collect::<Vec<_>>();
         for peer in peers {
-            let text = text.clone();
+            let payload = payload.clone();
             spawn_local(async move {
-                peer.send_text(update_id, &text).await;
+                match payload {
+                    ClipboardPayload::Text(text) => peer.send_text(update_id, &text).await,
+                    ClipboardPayload::ImagePng(png) => peer.send_image(update_id, &png).await,
+                }
             });
         }
     }
@@ -317,10 +320,10 @@ async fn read_loop(
         };
         if ClipboardFrame::is_clipboard_frame(&b[..len]) {
             match clipboard.handle_frame(&b[..len]).await {
-                Ok(Some((update_id, text))) => dtls_tx
-                    .send(ListenEvent::ClipboardText {
+                Ok(Some((update_id, payload))) => dtls_tx
+                    .send(ListenEvent::Clipboard {
                         update_id,
-                        text,
+                        payload,
                         addr,
                     })
                     .expect("channel closed"),
@@ -352,9 +355,7 @@ async fn read_loop(
     }
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|connection| connection.addr == addr);
+    let index = conns.iter().position(|connection| connection.addr == addr);
     let Some(index) = index else {
         return Ok(());
     };

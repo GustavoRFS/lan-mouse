@@ -418,6 +418,10 @@ impl Window {
         self.request(FrontendRequest::ClipboardText(text));
     }
 
+    pub(super) fn send_clipboard_image(&self, png_base64: String) {
+        self.request(FrontendRequest::ClipboardImage(png_base64));
+    }
+
     pub(super) fn set_clipboard_sharing(&self, enabled: bool) {
         self.imp().clipboard_sharing.set(enabled);
         self.imp().clipboard_sharing_switch.set_active(enabled);
