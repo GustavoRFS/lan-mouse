@@ -1,6 +1,8 @@
 use std::{
     cell::RefCell,
+    collections::HashSet,
     ffi::OsStr,
+    fs,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -11,8 +13,12 @@ use gtk::{
     glib::{self, types::StaticType},
     prelude::*,
 };
-use lan_mouse_proto::{ClipboardUpdateId, MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES};
+use lan_mouse_proto::{
+    ClipboardFile, ClipboardUpdateId, MAX_CLIPBOARD_FILES, MAX_CLIPBOARD_FILES_BYTES,
+    MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES, decode_file_bundle, encode_file_bundle,
+};
 use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 
 use crate::window::Window;
 
@@ -26,8 +32,10 @@ struct ClipboardState {
     generation: u64,
     pending_remote_text: Option<(ClipboardUpdateId, String)>,
     pending_remote_image: Option<[u8; 32]>,
+    pending_remote_files: Option<[u8; 32]>,
     last_local_text: Option<(String, Instant)>,
     last_local_image: Option<([u8; 32], Instant)>,
+    last_local_files: Option<([u8; 32], Instant)>,
 }
 
 /// Watches the desktop text clipboard and applies remote text without echoing it.
@@ -35,6 +43,7 @@ pub(crate) struct ClipboardSync {
     clipboard: gdk::Clipboard,
     state: Rc<RefCell<ClipboardState>>,
     wayland_watcher: RefCell<Option<gio::Subprocess>>,
+    staged_files: RefCell<Option<TempDir>>,
 }
 
 impl ClipboardSync {
@@ -46,6 +55,7 @@ impl ClipboardSync {
             clipboard: clipboard.clone(),
             state: Rc::new(RefCell::new(ClipboardState::default())),
             wayland_watcher: RefCell::new(None),
+            staged_files: RefCell::new(None),
         });
 
         let sync_weak = Rc::downgrade(&sync);
@@ -71,8 +81,10 @@ impl ClipboardSync {
         if !enabled {
             state.pending_remote_text = None;
             state.pending_remote_image = None;
+            state.pending_remote_files = None;
             state.last_local_text = None;
             state.last_local_image = None;
+            state.last_local_files = None;
         }
     }
 
@@ -89,10 +101,13 @@ impl ClipboardSync {
             state.generation = state.generation.wrapping_add(1);
             state.pending_remote_text = Some((update_id, text.clone()));
             state.pending_remote_image = None;
+            state.pending_remote_files = None;
             state.last_local_text = None;
             state.last_local_image = None;
+            state.last_local_files = None;
         }
         self.clipboard.set_text(&text);
+        self.staged_files.replace(None);
     }
 
     pub(crate) fn apply_remote_image(&self, _update_id: ClipboardUpdateId, png_base64: String) {
@@ -118,10 +133,73 @@ impl ClipboardSync {
             state.generation = state.generation.wrapping_add(1);
             state.pending_remote_text = None;
             state.pending_remote_image = Some(canonical_digest);
+            state.pending_remote_files = None;
             state.last_local_text = None;
             state.last_local_image = None;
+            state.last_local_files = None;
         }
         self.clipboard.set_texture(&texture);
+        self.staged_files.replace(None);
+    }
+
+    pub(crate) fn apply_remote_files(&self, _update_id: ClipboardUpdateId, bundle_base64: String) {
+        if bundle_base64.len() > MAX_CLIPBOARD_FILES_BYTES.div_ceil(3) * 4 {
+            return;
+        }
+        let Ok(bundle) = BASE64.decode(bundle_base64) else {
+            return;
+        };
+        let Ok(mut files) = decode_file_bundle(&bundle) else {
+            return;
+        };
+        if !self.state.borrow().enabled {
+            return;
+        }
+        let Ok(staging) = tempfile::Builder::new()
+            .prefix("lan-mouse-clipboard-")
+            .tempdir()
+        else {
+            return;
+        };
+        let mut used_names = HashSet::new();
+        let mut local_files = Vec::with_capacity(files.len());
+        for (index, file) in files.iter_mut().enumerate() {
+            let name = unique_file_name(&file.name, index, &mut used_names);
+            let path = staging.path().join(&name);
+            if fs::write(&path, &file.contents).is_err() {
+                return;
+            }
+            file.name = name;
+            local_files.push(gio::File::for_path(path));
+        }
+        let Ok(canonical) = encode_file_bundle(&files) else {
+            return;
+        };
+        let digest: [u8; 32] = Sha256::digest(&canonical).into();
+        {
+            let mut state = self.state.borrow_mut();
+            if !state.enabled {
+                return;
+            }
+            state.generation = state.generation.wrapping_add(1);
+            state.pending_remote_text = None;
+            state.pending_remote_image = None;
+            state.pending_remote_files = Some(digest);
+            state.last_local_text = None;
+            state.last_local_image = None;
+            state.last_local_files = None;
+        }
+        self.staged_files.replace(Some(staging));
+        #[cfg(windows)]
+        if crate::windows_clipboard::publish_file_paths(
+            &local_files
+                .iter()
+                .filter_map(gio::File::path)
+                .collect::<Vec<_>>(),
+        ) {
+            return;
+        }
+        self.clipboard.set(&gdk::FileList::from_array(&local_files));
     }
 
     fn handle_change(self: &Rc<Self>, clipboard: &gdk::Clipboard, window: &glib::WeakRef<Window>) {
@@ -130,6 +208,16 @@ impl ClipboardSync {
             state.generation = state.generation.wrapping_add(1);
             state.generation
         };
+        #[cfg(windows)]
+        if let Some(paths) = crate::windows_clipboard::copied_file_paths() {
+            read_local_files(
+                self.state.clone(),
+                window.clone(),
+                generation,
+                paths.into_iter().map(gio::File::for_path).collect(),
+            );
+            return;
+        }
         self.read_changed_text(clipboard, window, generation, 0);
     }
 
@@ -250,7 +338,20 @@ impl ClipboardSync {
             }
         }
         if is_file_clipboard(clipboard) {
-            clear_pending_text(&self.state, generation);
+            let state = self.state.clone();
+            let window = window.clone();
+            clipboard.read_value_async(
+                gdk::FileList::static_type(),
+                glib::Priority::default(),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    if let Ok(value) = result {
+                        if let Ok(files) = value.get::<gdk::FileList>() {
+                            read_local_files(state, window, generation, files.files());
+                        }
+                    }
+                },
+            );
             return;
         }
         if has_image_format(clipboard) {
@@ -298,6 +399,7 @@ fn clear_pending_text(state: &Rc<RefCell<ClipboardState>>, generation: u64) {
     if current.enabled && current.generation == generation {
         current.pending_remote_text = None;
         current.pending_remote_image = None;
+        current.pending_remote_files = None;
     }
 }
 
@@ -329,6 +431,7 @@ fn deliver_local_text(
         } else {
             state.pending_remote_text = None;
             state.pending_remote_image = None;
+            state.pending_remote_files = None;
             state.last_local_text = Some((text.to_string(), Instant::now()));
             true
         }
@@ -366,6 +469,7 @@ fn deliver_local_image(
         } else {
             state.pending_remote_text = None;
             state.pending_remote_image = None;
+            state.pending_remote_files = None;
             state.last_local_image = Some((digest, Instant::now()));
             true
         }
@@ -375,6 +479,155 @@ fn deliver_local_image(
             window.send_clipboard_image(BASE64.encode(png));
         }
     }
+}
+
+fn read_local_files(
+    state: Rc<RefCell<ClipboardState>>,
+    window: glib::WeakRef<Window>,
+    generation: u64,
+    files: Vec<gio::File>,
+) {
+    if files.is_empty() || files.len() > MAX_CLIPBOARD_FILES {
+        clear_pending_text(&state, generation);
+        return;
+    }
+    glib::spawn_future_local(async move {
+        let mut entries = Vec::with_capacity(files.len());
+        let mut total_bytes = 6usize;
+        for file in files {
+            if !state.borrow().enabled || state.borrow().generation != generation {
+                return;
+            }
+            let Some(path) = file.path() else {
+                clear_pending_text(&state, generation);
+                return;
+            };
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                clear_pending_text(&state, generation);
+                return;
+            };
+            if !metadata.is_file() || metadata.len() > MAX_CLIPBOARD_FILES_BYTES as u64 {
+                clear_pending_text(&state, generation);
+                return;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                clear_pending_text(&state, generation);
+                return;
+            };
+            total_bytes = total_bytes.saturating_add(2 + name.len() + 4 + metadata.len() as usize);
+            if total_bytes > MAX_CLIPBOARD_FILES_BYTES {
+                clear_pending_text(&state, generation);
+                return;
+            }
+            let Ok((contents, _)) = file.load_contents_future().await else {
+                clear_pending_text(&state, generation);
+                return;
+            };
+            if contents.len() != metadata.len() as usize {
+                clear_pending_text(&state, generation);
+                return;
+            }
+            entries.push(ClipboardFile {
+                name: name.to_owned(),
+                contents: contents.to_vec(),
+            });
+        }
+        if let Ok(bundle) = encode_file_bundle(&entries) {
+            deliver_local_files(&state, &window, generation, &bundle);
+        }
+    });
+}
+
+fn deliver_local_files(
+    state: &Rc<RefCell<ClipboardState>>,
+    window: &glib::WeakRef<Window>,
+    generation: u64,
+    bundle: &[u8],
+) {
+    let digest: [u8; 32] = Sha256::digest(bundle).into();
+    let should_send = {
+        let mut state = state.borrow_mut();
+        if !state.enabled || state.generation != generation {
+            return;
+        }
+        let remote_echo = state.pending_remote_files == Some(digest);
+        let duplicate_local = state
+            .last_local_files
+            .as_ref()
+            .is_some_and(|(last, at)| *last == digest && at.elapsed() < DUPLICATE_TEXT_WINDOW);
+        if remote_echo || duplicate_local {
+            false
+        } else {
+            state.pending_remote_text = None;
+            state.pending_remote_image = None;
+            state.pending_remote_files = None;
+            state.last_local_files = Some((digest, Instant::now()));
+            true
+        }
+    };
+    if should_send {
+        if let Some(window) = window.upgrade() {
+            window.send_clipboard_files(BASE64.encode(bundle));
+        }
+    }
+}
+
+fn unique_file_name(name: &str, index: usize, used: &mut HashSet<String>) -> String {
+    let mut clean = name
+        .chars()
+        .map(|character| {
+            if character.is_control() || "<>:\"/\\|?*".contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    clean = clean.trim_end_matches([' ', '.']).to_owned();
+    while clean.len() > 200 {
+        clean.pop();
+    }
+    let stem = clean
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if clean.is_empty()
+        || matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+    {
+        clean = format!("file-{}", index + 1);
+    }
+    let mut candidate = clean.clone();
+    let mut suffix = 2;
+    while !used.insert(candidate.to_lowercase()) {
+        candidate = format!("{clean} ({suffix})");
+        suffix += 1;
+    }
+    candidate
 }
 
 fn read_wayland_selection(
@@ -392,8 +645,18 @@ fn read_wayland_selection(
             return;
         };
         let mime_types = types.lines().map(str::trim).collect::<Vec<_>>();
-        if mime_types.iter().any(|mime| *mime == "text/uri-list") {
-            clear_pending_text(&state, generation);
+        if mime_types.contains(&"text/uri-list") {
+            if let Some(uris) = run_wl_paste(&["--type", "text/uri-list"]).await {
+                let files = uris
+                    .lines()
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .filter_map(|uri| {
+                        let file = gio::File::for_uri(uri.trim());
+                        file.path().map(|_| file)
+                    })
+                    .collect::<Vec<_>>();
+                read_local_files(state, window, generation, files);
+            }
             return;
         }
         if let Some(mime) = ["image/png", "image/jpeg", "image/webp"]

@@ -16,7 +16,8 @@ use lan_mouse_ipc::{
     IpcListenerCreationError, Position, Status,
 };
 use lan_mouse_proto::{
-    ClipboardReassembler, ClipboardUpdateId, MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
+    ClipboardReassembler, ClipboardUpdateId, MAX_CLIPBOARD_FILES_BYTES, MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_TEXT_BYTES, decode_file_bundle,
 };
 use log;
 use std::{
@@ -259,6 +260,9 @@ impl Service {
             FrontendRequest::ClipboardImage(png_base64) => {
                 self.share_local_clipboard_image(png_base64)
             }
+            FrontendRequest::ClipboardFiles(bundle_base64) => {
+                self.share_local_clipboard_files(bundle_base64)
+            }
         }
     }
 
@@ -483,6 +487,21 @@ impl Service {
         self.broadcast_local_clipboard(ClipboardPayload::ImagePng(png));
     }
 
+    fn share_local_clipboard_files(&mut self, bundle_base64: String) {
+        if !self.clipboard_sharing
+            || bundle_base64.len() > MAX_CLIPBOARD_FILES_BYTES.div_ceil(3) * 4
+        {
+            return;
+        }
+        let Ok(bundle) = BASE64.decode(bundle_base64) else {
+            return;
+        };
+        if decode_file_bundle(&bundle).is_err() {
+            return;
+        }
+        self.broadcast_local_clipboard(ClipboardPayload::Files(bundle));
+    }
+
     fn broadcast_local_clipboard(&mut self, payload: ClipboardPayload) {
         self.clipboard_sequence = self.clipboard_sequence.wrapping_add(1).max(1);
         let mut update_id: ClipboardUpdateId = [0; 16];
@@ -507,6 +526,16 @@ impl Service {
                 });
             }
             ClipboardPayload::ImagePng(_) => {}
+            ClipboardPayload::Files(bundle)
+                if bundle.len() <= MAX_CLIPBOARD_FILES_BYTES
+                    && decode_file_bundle(&bundle).is_ok() =>
+            {
+                self.notify_frontend(FrontendEvent::ClipboardFilesUpdate {
+                    update_id,
+                    bundle_base64: BASE64.encode(bundle),
+                });
+            }
+            ClipboardPayload::Files(_) => {}
         }
     }
 

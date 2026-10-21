@@ -10,7 +10,7 @@ use std::{
 use futures::future::join_all;
 use lan_mouse_proto::{
     ClipboardFrame, ClipboardReassembler, ClipboardReassemblyResult, ClipboardUpdateId,
-    ProtocolError, chunk_image, chunk_text,
+    ProtocolError, chunk_files, chunk_image, chunk_text,
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -26,6 +26,7 @@ pub(crate) type SharedClipboardReassembler = Arc<Mutex<ClipboardReassembler>>;
 pub(crate) enum ClipboardPayload {
     Text(String),
     ImagePng(Vec<u8>),
+    Files(Vec<u8>),
 }
 
 impl std::fmt::Debug for ClipboardPayload {
@@ -33,6 +34,7 @@ impl std::fmt::Debug for ClipboardPayload {
         match self {
             Self::Text(text) => formatter.debug_tuple("Text").field(&text.len()).finish(),
             Self::ImagePng(png) => formatter.debug_tuple("ImagePng").field(&png.len()).finish(),
+            Self::Files(bundle) => formatter.debug_tuple("Files").field(&bundle.len()).finish(),
         }
     }
 }
@@ -46,6 +48,7 @@ const CAPABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 struct PeerState {
     supports_clipboard: bool,
     supports_image: bool,
+    supports_files: bool,
     chunk_acks: HashMap<(ClipboardUpdateId, u16), oneshot::Sender<()>>,
     update_acks: HashMap<ClipboardUpdateId, oneshot::Sender<bool>>,
     transfer_cancel: CancellationToken,
@@ -56,6 +59,7 @@ impl Default for PeerState {
         Self {
             supports_clipboard: false,
             supports_image: false,
+            supports_files: false,
             chunk_acks: HashMap::new(),
             update_acks: HashMap::new(),
             transfer_cancel: CancellationToken::new(),
@@ -90,6 +94,9 @@ impl ClipboardPeer {
         if let Err(error) = self.send_frame(ClipboardFrame::ImageCapabilities).await {
             log::debug!("could not advertise image clipboard support: {error}");
         }
+        if let Err(error) = self.send_frame(ClipboardFrame::FileCapabilities).await {
+            log::debug!("could not advertise file clipboard support: {error}");
+        }
     }
 
     pub(crate) async fn send_text(&self, update_id: ClipboardUpdateId, text: &str) {
@@ -100,7 +107,7 @@ impl ClipboardPeer {
                 return;
             }
         };
-        self.send_frames(update_id, frames, false).await;
+        self.send_frames(update_id, frames, false, false).await;
     }
 
     pub(crate) async fn send_image(&self, update_id: ClipboardUpdateId, png: &[u8]) {
@@ -111,7 +118,18 @@ impl ClipboardPeer {
                 return;
             }
         };
-        self.send_frames(update_id, frames, true).await;
+        self.send_frames(update_id, frames, true, false).await;
+    }
+
+    pub(crate) async fn send_files(&self, update_id: ClipboardUpdateId, bundle: &[u8]) {
+        let frames = match chunk_files(update_id, bundle) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log::debug!("clipboard files could not be chunked: {error}");
+                return;
+            }
+        };
+        self.send_frames(update_id, frames, false, true).await;
     }
 
     async fn send_frames(
@@ -119,6 +137,7 @@ impl ClipboardPeer {
         update_id: ClipboardUpdateId,
         frames: Vec<ClipboardFrame>,
         image: bool,
+        files: bool,
     ) {
         let (generation, cancellation) = {
             let mut state = self.state.lock().await;
@@ -129,7 +148,7 @@ impl ClipboardPeer {
             (generation, cancellation)
         };
         if !self
-            .wait_until_ready(generation, &cancellation, image)
+            .wait_until_ready(generation, &cancellation, image, files)
             .await
             || !self.is_current(generation)
         {
@@ -198,6 +217,7 @@ impl ClipboardPeer {
         self.reassembler.lock().await.expire();
         let frame = ClipboardFrame::decode(data)?;
         let image = matches!(frame, ClipboardFrame::ImageChunk { .. });
+        let files = matches!(frame, ClipboardFrame::FileChunk { .. });
         match frame {
             ClipboardFrame::Capabilities => {
                 self.mark_supported().await;
@@ -213,6 +233,13 @@ impl ClipboardPeer {
                     .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
             }
             ClipboardFrame::ImageCapabilitiesAck => self.mark_image_supported().await,
+            ClipboardFrame::FileCapabilities => {
+                self.mark_files_supported().await;
+                self.send_frame(ClipboardFrame::FileCapabilitiesAck)
+                    .await
+                    .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+            }
+            ClipboardFrame::FileCapabilitiesAck => self.mark_files_supported().await,
             ClipboardFrame::TextChunk {
                 update_id,
                 index,
@@ -228,11 +255,28 @@ impl ClipboardPeer {
                 total_bytes,
                 checksum,
                 payload,
+            }
+            | ClipboardFrame::FileChunk {
+                update_id,
+                index,
+                count,
+                total_bytes,
+                checksum,
+                payload,
             } => {
-                if !self.supports_kind(image).await {
+                if !self.supports_kind(image, files).await {
                     return Err(ProtocolError::InvalidClipboardFrame);
                 }
-                let result = if image {
+                let result = if files {
+                    self.reassembler.lock().await.push_files(
+                        update_id,
+                        index,
+                        count,
+                        total_bytes,
+                        checksum,
+                        payload,
+                    )
+                } else if image {
                     self.reassembler.lock().await.push_image(
                         update_id,
                         index,
@@ -285,6 +329,15 @@ impl ClipboardPeer {
                             .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
                         return Ok(Some((update_id, ClipboardPayload::ImagePng(png))));
                     }
+                    Ok(ClipboardReassemblyResult::CompleteFiles(bundle)) => {
+                        self.send_frame(ClipboardFrame::TextChunkAck { update_id, index })
+                            .await
+                            .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+                        self.send_frame(ClipboardFrame::TextUpdateAck(update_id))
+                            .await
+                            .map_err(|_| ProtocolError::InvalidClipboardFrame)?;
+                        return Ok(Some((update_id, ClipboardPayload::Files(bundle))));
+                    }
                     Err(error) => {
                         let _ = self
                             .send_frame(ClipboardFrame::TextUpdateNack(update_id))
@@ -327,20 +380,21 @@ impl ClipboardPeer {
         generation: u64,
         cancellation: &CancellationToken,
         image: bool,
+        files: bool,
     ) -> bool {
         let deadline = tokio::time::Instant::now() + CAPABILITY_TIMEOUT;
         loop {
             if !self.is_current(generation) || cancellation.is_cancelled() {
                 return false;
             }
-            if self.supports_kind(image).await {
+            if self.supports_kind(image, files).await {
                 return true;
             }
             let notified = self.ready.notified();
             if !self.is_current(generation) || cancellation.is_cancelled() {
                 return false;
             }
-            if self.supports_kind(image).await {
+            if self.supports_kind(image, files).await {
                 return true;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -351,7 +405,9 @@ impl ClipboardPeer {
                 _ = cancellation.cancelled() => return false,
                 result = timeout(remaining.min(Duration::from_millis(500)), notified) => {
                     if result.is_err() {
-                        let capability = if image {
+                        let capability = if files {
+                            ClipboardFrame::FileCapabilities
+                        } else if image {
                             ClipboardFrame::ImageCapabilities
                         } else {
                             ClipboardFrame::Capabilities
@@ -373,8 +429,14 @@ impl ClipboardPeer {
         self.state.lock().await.supports_image
     }
 
-    async fn supports_kind(&self, image: bool) -> bool {
-        if image {
+    async fn supports_files(&self) -> bool {
+        self.state.lock().await.supports_files
+    }
+
+    async fn supports_kind(&self, image: bool, files: bool) -> bool {
+        if files {
+            self.supports_files().await
+        } else if image {
             self.supports_image().await
         } else {
             self.supports_clipboard().await
@@ -391,6 +453,11 @@ impl ClipboardPeer {
         self.ready.notify_waiters();
     }
 
+    async fn mark_files_supported(&self) {
+        self.state.lock().await.supports_files = true;
+        self.ready.notify_waiters();
+    }
+
     async fn send_chunk_with_retry(
         &self,
         generation: u64,
@@ -402,6 +469,9 @@ impl ClipboardPeer {
                 update_id, index, ..
             }
             | ClipboardFrame::ImageChunk {
+                update_id, index, ..
+            }
+            | ClipboardFrame::FileChunk {
                 update_id, index, ..
             } => (update_id, index),
             _ => return false,

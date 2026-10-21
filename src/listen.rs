@@ -255,6 +255,7 @@ impl LanMouseListener {
                 match payload {
                     ClipboardPayload::Text(text) => peer.send_text(update_id, &text).await,
                     ClipboardPayload::ImagePng(png) => peer.send_image(update_id, &png).await,
+                    ClipboardPayload::Files(bundle) => peer.send_files(update_id, &bundle).await,
                 }
             });
         }

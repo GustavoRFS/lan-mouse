@@ -14,6 +14,7 @@ hostname = "0.4.0"
 log = "0.4.20"
 base64 = "0.22.1"
 sha2 = "0.10.8"
+tempfile = "3.10.1"
 lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.4.0" }
 lan-mouse-proto = { path = "../lan-mouse-proto", version = "0.4.0" }
 thiserror = "2.0.0"
@@ -22,6 +23,8 @@ thiserror = "2.0.0"
 windows = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

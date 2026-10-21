@@ -235,6 +235,11 @@ pub enum FrontendEvent {
         update_id: [u8; 16],
         png_base64: String,
     },
+    /// Native file clipboard update received from an authenticated peer.
+    ClipboardFilesUpdate {
+        update_id: [u8; 16],
+        bundle_base64: String,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -281,6 +286,8 @@ pub enum FrontendRequest {
     ClipboardText(String),
     /// Base64-encoded PNG copied on this device.
     ClipboardImage(String),
+    /// Base64-encoded file bundle copied on this device.
+    ClipboardFiles(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

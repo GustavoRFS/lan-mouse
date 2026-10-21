@@ -34,6 +34,10 @@ thread_local! {
     static TRAY_STATE: RefCell<Option<TrayState>> = const { RefCell::new(None) };
 }
 
+pub(crate) fn clipboard_owner_hwnd() -> Option<HWND> {
+    TRAY_STATE.with(|state| state.borrow().as_ref().map(|state| state.hwnd))
+}
+
 pub fn setup(app: &adw::Application, window: &Window) {
     unsafe {
         let hold = app.hold();

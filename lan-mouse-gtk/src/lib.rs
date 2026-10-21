@@ -13,6 +13,8 @@ mod macos_privacy;
 mod macos_status_item;
 mod window;
 #[cfg(windows)]
+mod windows_clipboard;
+#[cfg(windows)]
 mod windows_tray;
 
 use std::{env, process, str, sync::OnceLock};
@@ -347,6 +349,12 @@ fn build_ui(app: &Application) {
                         png_base64,
                     } => {
                         clipboard_sync.apply_remote_image(update_id, png_base64);
+                    }
+                    FrontendEvent::ClipboardFilesUpdate {
+                        update_id,
+                        bundle_base64,
+                    } => {
+                        clipboard_sync.apply_remote_files(update_id, bundle_base64);
                     }
                 }
             }
