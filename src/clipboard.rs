@@ -150,10 +150,17 @@ impl ClipboardPeer {
         if !self
             .wait_until_ready(generation, &cancellation, image, files)
             .await
-            || !self.is_current(generation)
         {
+            log::debug!("peer did not confirm clipboard support (image: {image}, files: {files})");
             return;
         }
+        if !self.is_current(generation) {
+            return;
+        }
+        log::debug!(
+            "sending clipboard update in {} frames (image: {image}, files: {files})",
+            frames.len()
+        );
 
         for _ in 0..MAX_RETRIES {
             if !self.is_current(generation) {
@@ -195,7 +202,10 @@ impl ClipboardPeer {
                 result = timeout(UPDATE_ACK_TIMEOUT, ack_rx) => result,
             };
             match ack_result {
-                Ok(Ok(true)) => return,
+                Ok(Ok(true)) => {
+                    log::debug!("peer acknowledged clipboard update");
+                    return;
+                }
                 Ok(Ok(false)) => log::debug!("peer rejected clipboard update"),
                 Ok(Err(_)) | Err(_) => {
                     log::debug!("clipboard update acknowledgement timed out")

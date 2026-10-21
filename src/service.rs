@@ -475,6 +475,10 @@ impl Service {
     }
 
     fn share_local_clipboard_image(&mut self, png_base64: String) {
+        log::debug!(
+            "frontend shared clipboard image ({} base64 bytes)",
+            png_base64.len()
+        );
         if !self.clipboard_sharing || png_base64.len() > MAX_CLIPBOARD_IMAGE_BYTES.div_ceil(3) * 4 {
             return;
         }
