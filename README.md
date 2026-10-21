@@ -329,6 +329,8 @@ Clipboard sharing is enabled by default and can be paused from the General
 section. The first stage synchronizes plain text up to 256 KiB between directly
 connected devices on Windows and Linux. Image and file clipboard transfer are
 planned follow-up stages.
+On wlroots Wayland desktops, install `wl-clipboard` so sharing continues while
+the Lan Mouse window is hidden in the tray.
 
 To connect a device you want to control, simply click the `Add` button and enter the hostname
 of the device.

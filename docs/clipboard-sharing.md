@@ -15,7 +15,7 @@ Share clipboard content between Lan Mouse peers on Windows and Linux. The work i
 
 ## Architecture
 
-- The GTK frontend reads and writes the desktop clipboard through GDK on both Windows and Linux. It observes clipboard changes only while sharing is enabled and suppresses the change notification caused by applying a remote update.
+- The GTK frontend reads and writes the desktop clipboard through GDK. On Wayland, where a hidden GTK window may not receive clipboard offers, it also uses `wl-paste --watch` and reads text with `wl-paste` when GDK has no formats. This requires `wl-clipboard` and a compositor with the wlroots data-control protocol. It suppresses change notifications caused by applying a remote update.
 - The frontend and daemon communicate clipboard state through the existing local IPC. Text is bounded before it crosses that interface.
 - The daemon distributes local updates over its existing outgoing and incoming DTLS sessions. Incoming clipboard events are surfaced to the GTK frontend without forwarding them to other peers.
 - Clipboard wire messages use a separate, versioned variable-length frame format. The fixed-size `ProtoEvent` format remains for mouse and keyboard input. Clipboard frames are at most 1200 bytes, split into chunks, tagged with a 128-bit update ID, reassembled with a 256 KiB per-update and 4 MiB global memory cap, and acknowledged so lost chunks can be retried. At most 64 incomplete updates are held globally; incomplete transfers expire after 30 seconds, and newer updates from the same origin supersede older pending updates.
