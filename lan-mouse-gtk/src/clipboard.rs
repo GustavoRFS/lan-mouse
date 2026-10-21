@@ -41,10 +41,7 @@ impl ClipboardSync {
             .clipboard();
         let sync = Rc::new(Self {
             clipboard: clipboard.clone(),
-            state: Rc::new(RefCell::new(ClipboardState {
-                enabled: true,
-                ..Default::default()
-            })),
+            state: Rc::new(RefCell::new(ClipboardState::default())),
             wayland_watcher: RefCell::new(None),
         });
 
@@ -137,6 +134,7 @@ impl ClipboardSync {
         let sync_weak = Rc::downgrade(self);
         let started = Instant::now();
         glib::spawn_future_local(async move {
+            let mut initial_selection = true;
             loop {
                 let Ok(bytes) = stdout.read_bytes_future(64, glib::Priority::default()).await else {
                     break;
@@ -148,6 +146,10 @@ impl ClipboardSync {
                     break;
                 };
                 for _ in bytes.as_ref() {
+                    if initial_selection {
+                        initial_selection = false;
+                        continue;
+                    }
                     sync.handle_wayland_change(&window);
                 }
             }
