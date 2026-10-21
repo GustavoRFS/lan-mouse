@@ -20,7 +20,6 @@ use crate::{file_offer::OFFER_MARKER_MIME, window::Window};
 
 const FORMAT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_FORMAT_RETRIES: u8 = 5;
-const DUPLICATE_TEXT_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct ClipboardState {
@@ -28,9 +27,12 @@ struct ClipboardState {
     generation: u64,
     pending_remote_text: Option<(ClipboardUpdateId, String)>,
     pending_remote_image: Option<[u8; 32]>,
-    last_local_text: Option<(String, Instant)>,
-    last_local_image: Option<([u8; 32], Instant)>,
-    last_local_files: Option<([u8; 32], Instant)>,
+    // Last content shared from this device, cleared whenever a peer's update
+    // replaces the clipboard. The desktop re-announces the current selection,
+    // e.g. when focus returns, which must not resend it over a peer's copy.
+    last_local_text: Option<String>,
+    last_local_image: Option<[u8; 32]>,
+    last_local_files: Option<[u8; 32]>,
 }
 
 /// Watches the desktop text clipboard and applies remote text without echoing it.
@@ -396,13 +398,13 @@ fn deliver_local_text(
         let duplicate_local = state
             .last_local_text
             .as_ref()
-            .is_some_and(|(last, at)| last == text && at.elapsed() < DUPLICATE_TEXT_WINDOW);
+            .is_some_and(|last| last == text);
         if remote_echo || duplicate_local {
             false
         } else {
             state.pending_remote_text = None;
             state.pending_remote_image = None;
-            state.last_local_text = Some((text.to_string(), Instant::now()));
+            state.last_local_text = Some(text.to_string());
             true
         }
     };
@@ -433,13 +435,13 @@ fn deliver_local_image(
         let duplicate_local = state
             .last_local_image
             .as_ref()
-            .is_some_and(|(last, at)| *last == digest && at.elapsed() < DUPLICATE_TEXT_WINDOW);
+            .is_some_and(|last| *last == digest);
         if remote_echo || duplicate_local {
             false
         } else {
             state.pending_remote_text = None;
             state.pending_remote_image = None;
-            state.last_local_image = Some((digest, Instant::now()));
+            state.last_local_image = Some(digest);
             true
         }
     };
@@ -480,13 +482,13 @@ fn share_local_files(
         let duplicate_local = state
             .last_local_files
             .as_ref()
-            .is_some_and(|(last, at)| *last == digest && at.elapsed() < DUPLICATE_TEXT_WINDOW);
+            .is_some_and(|last| *last == digest);
         if duplicate_local {
             false
         } else {
             state.pending_remote_text = None;
             state.pending_remote_image = None;
-            state.last_local_files = Some((digest, Instant::now()));
+            state.last_local_files = Some(digest);
             true
         }
     };
