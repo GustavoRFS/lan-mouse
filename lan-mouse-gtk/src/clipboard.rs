@@ -138,8 +138,12 @@ impl ClipboardSync {
             state.last_local_image = None;
             state.last_local_files = None;
         }
-        self.clipboard.set_texture(&texture);
         self.staged_files.replace(None);
+        #[cfg(windows)]
+        if crate::windows_clipboard::publish_image(&png, &texture) {
+            return;
+        }
+        self.clipboard.set_texture(&texture);
     }
 
     pub(crate) fn apply_remote_files(&self, _update_id: ClipboardUpdateId, bundle_base64: String) {
@@ -482,6 +486,10 @@ fn deliver_local_image(
             true
         }
     };
+    log::debug!(
+        "local clipboard image: {} bytes, sending: {should_send}",
+        png.len()
+    );
     if should_send {
         if let Some(window) = window.upgrade() {
             window.send_clipboard_image(BASE64.encode(png));
@@ -653,6 +661,7 @@ fn read_wayland_selection(
             return;
         };
         let mime_types = types.lines().map(str::trim).collect::<Vec<_>>();
+        log::debug!("wayland selection changed: {} formats", mime_types.len());
         if mime_types.contains(&"text/uri-list") {
             if let Some(uris) = run_wl_paste(&["--type", "text/uri-list"]).await {
                 let files = uris
@@ -677,8 +686,11 @@ fn read_wayland_selection(
             if let Some(bytes) =
                 run_wl_paste_bytes(&["--type", mime], MAX_CLIPBOARD_IMAGE_BYTES).await
             {
-                if let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice()))
-                {
+                let texture = gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice()));
+                if let Err(error) = &texture {
+                    log::debug!("could not decode clipboard image ({mime}): {error}");
+                }
+                if let Ok(texture) = texture {
                     deliver_local_image(
                         &state,
                         &window,
