@@ -1,4 +1,7 @@
-use std::{ffi::OsString, mem::size_of, os::windows::ffi::OsStringExt, path::PathBuf, ptr};
+use std::{
+    ffi::OsString, mem::size_of, os::windows::ffi::OsStringExt, path::PathBuf, ptr, thread,
+    time::Duration,
+};
 
 use gtk::{gdk, prelude::*};
 use windows::{
@@ -24,6 +27,8 @@ const CF_DIBV5: u32 = 17;
 const LCS_SRGB: u32 = 0x7352_4742;
 const LCS_GM_IMAGES: u32 = 4;
 const MAX_DIB_BYTES: usize = 256 * 1024 * 1024;
+const OPEN_ATTEMPTS: u32 = 10;
+const OPEN_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 struct ClipboardGuard;
 
@@ -35,11 +40,39 @@ impl Drop for ClipboardGuard {
     }
 }
 
-pub(crate) fn copied_file_paths() -> Option<Vec<PathBuf>> {
+/// Files copied in Explorer (CF_HDROP).
+pub(crate) enum CopiedFiles {
+    None,
+    Paths(Vec<PathBuf>),
+    /// Files are on the clipboard but could not be read.
+    Unreadable,
+}
+
+pub(crate) fn copied_files() -> CopiedFiles {
+    if unsafe { IsClipboardFormatAvailable(CF_HDROP) }.is_err() {
+        return CopiedFiles::None;
+    }
+    // Right after a change the copying app or GTK's own clipboard thread may
+    // still hold the clipboard open, so opening it can fail for a moment.
+    for attempt in 0..OPEN_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(OPEN_RETRY_DELAY);
+        }
+        if unsafe { OpenClipboard(None) }.is_ok() {
+            let _guard = ClipboardGuard;
+            return match unsafe { read_file_list() } {
+                Some(paths) => CopiedFiles::Paths(paths),
+                None => CopiedFiles::Unreadable,
+            };
+        }
+    }
+    log::debug!("clipboard holds copied files but could not be opened");
+    CopiedFiles::Unreadable
+}
+
+/// Reads CF_HDROP; the clipboard has to be open.
+unsafe fn read_file_list() -> Option<Vec<PathBuf>> {
     unsafe {
-        IsClipboardFormatAvailable(CF_HDROP).ok()?;
-        OpenClipboard(None).ok()?;
-        let _guard = ClipboardGuard;
         let handle = GetClipboardData(CF_HDROP).ok()?;
         let drop = HDROP(handle.0);
         let count = DragQueryFileW(drop, u32::MAX, None);
