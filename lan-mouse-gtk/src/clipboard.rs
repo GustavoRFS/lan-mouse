@@ -183,9 +183,18 @@ impl ClipboardSync {
             state.generation
         };
         #[cfg(windows)]
-        if let Some(paths) = crate::windows_clipboard::copied_file_paths() {
-            share_local_files(&self.state, window, generation, paths);
-            return;
+        match crate::windows_clipboard::copied_files() {
+            crate::windows_clipboard::CopiedFiles::Paths(paths) => {
+                log::debug!("local clipboard files: {} items", paths.len());
+                share_local_files(&self.state, window, generation, paths);
+                return;
+            }
+            // reading text here would send a stale text clipboard instead
+            crate::windows_clipboard::CopiedFiles::Unreadable => {
+                clear_pending_text(&self.state, generation);
+                return;
+            }
+            crate::windows_clipboard::CopiedFiles::None => {}
         }
         self.read_changed_text(clipboard, window, generation, 0);
     }
