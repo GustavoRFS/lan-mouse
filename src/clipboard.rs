@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -90,6 +90,9 @@ impl Default for PeerState {
 /// State and reliable transfer helpers for one authenticated DTLS session.
 pub(crate) struct ClipboardPeer {
     conn: ArcConn,
+    /// Address of the peer. Connections opened from this side run over a
+    /// plain UDP socket whose `remote_addr()` is always `None`.
+    addr: SocketAddr,
     reassembler: SharedClipboardReassembler,
     state: Mutex<PeerState>,
     ready: Notify,
@@ -97,9 +100,14 @@ pub(crate) struct ClipboardPeer {
 }
 
 impl ClipboardPeer {
-    pub(crate) fn new(conn: ArcConn, reassembler: SharedClipboardReassembler) -> Self {
+    pub(crate) fn new(
+        conn: ArcConn,
+        addr: SocketAddr,
+        reassembler: SharedClipboardReassembler,
+    ) -> Self {
         Self {
             conn,
+            addr,
             reassembler,
             state: Mutex::new(PeerState::default()),
             ready: Notify::new(),
@@ -169,7 +177,7 @@ impl ClipboardPeer {
     }
 
     async fn offer_source(&self) -> Option<OfferSource> {
-        let ip = self.conn.remote_addr()?.ip();
+        let ip = self.addr.ip();
         let dtls: &DTLSConn = self.conn.as_any().downcast_ref()?;
         let certificates = dtls.connection_state().await.peer_certificates;
         let fingerprint = crypto::generate_fingerprint(certificates.first()?);
