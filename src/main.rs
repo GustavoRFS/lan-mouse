@@ -18,6 +18,7 @@ use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
 use std::{
     future::Future,
     io,
+    path::Path,
     process::{self, Child},
 };
 use thiserror::Error;
@@ -105,6 +106,7 @@ fn main() {
     // GUI binary has no console unless `--debug` opens one. The daemon inherits
     // the variable and appends to the same file.
     if let Some(path) = std::env::var_os("LAN_MOUSE_LOG_FILE") {
+        rotate_log_file(Path::new(&path));
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -121,6 +123,22 @@ fn main() {
     if let Err(e) = run() {
         log::error!("{e}");
         process::exit(1);
+    }
+}
+
+/// Keeps the log file bounded: once it exceeds this size it is moved to
+/// `<name>.old` (replacing the previous one) when Lan Mouse starts. The daemon
+/// started by the frontend finds the fresh file and leaves it alone.
+const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+fn rotate_log_file(path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() > MAX_LOG_FILE_BYTES {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old");
+        let _ = std::fs::rename(path, old);
     }
 }
 
