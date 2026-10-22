@@ -531,21 +531,15 @@ impl Service {
         }
         // Outgoing connections do not verify the peer certificate, so a file
         // offer is only accepted from a peer whose key is authorized here.
-        if let ClipboardPayload::FileOffer {
-            source: Some(source),
-            ..
-        } = &payload
-        {
-            let authorized = self
-                .authorized_keys
-                .read()
-                .expect("lock")
-                .contains_key(&source.fingerprint);
+        if let ClipboardPayload::FileOffer { source, .. } = &payload {
+            let authorized = source.as_ref().is_some_and(|source| {
+                self.authorized_keys
+                    .read()
+                    .expect("lock")
+                    .contains_key(&source.fingerprint)
+            });
             if !authorized {
-                log::warn!(
-                    "ignoring file offer from {}: its key is not authorized",
-                    source.ip
-                );
+                log::warn!("ignoring file offer from an unauthorized peer");
                 return;
             }
         }
