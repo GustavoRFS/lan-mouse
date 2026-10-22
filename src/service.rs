@@ -529,6 +529,26 @@ impl Service {
         if !self.clipboard_sharing {
             return;
         }
+        // Outgoing connections do not verify the peer certificate, so a file
+        // offer is only accepted from a peer whose key is authorized here.
+        if let ClipboardPayload::FileOffer {
+            source: Some(source),
+            ..
+        } = &payload
+        {
+            let authorized = self
+                .authorized_keys
+                .read()
+                .expect("lock")
+                .contains_key(&source.fingerprint);
+            if !authorized {
+                log::warn!(
+                    "ignoring file offer from {}: its key is not authorized",
+                    source.ip
+                );
+                return;
+            }
+        }
         // the local clipboard is replaced, so files copied here are gone from it
         self.file_transfer.withdraw();
         match payload {
