@@ -258,7 +258,7 @@ async fn connect_to_handle(
         };
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
-        let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), reassembler));
+        let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), addr, reassembler));
         clipboard.advertise().await;
         conns.lock().await.insert(
             addr,

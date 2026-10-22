@@ -146,7 +146,7 @@ impl LanMouseListener {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
-                                let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), reassembler.clone()));
+                                let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), addr, reassembler.clone()));
                                 clipboard.advertise().await;
                                 conns_clone.lock().await.push(IncomingConnection {
                                     addr,
