@@ -98,6 +98,15 @@ fn main() {
     #[cfg(windows)]
     init_console();
 
+    init_logging();
+
+    if let Err(e) = run() {
+        log::error!("{e}");
+        process::exit(1);
+    }
+}
+
+fn init_logging() {
     // init logging
     let default_level = if debug_requested() { "debug" } else { "info" };
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", default_level);
@@ -120,9 +129,54 @@ fn main() {
     }
     logger.init();
 
-    if let Err(e) = run() {
-        log::error!("{e}");
-        process::exit(1);
+    // The Windows GUI redirects stderr to NUL. The default panic hook alone
+    // would discard the cause of an abort even when file logging is enabled.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!(
+            "{info}\nbacktrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        log::logger().flush();
+        default_hook(info);
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn panic_logging_child() {
+        if std::env::var_os("LAN_MOUSE_PANIC_LOG_TEST").is_none() {
+            return;
+        }
+        super::init_logging();
+        panic!("lan-mouse regression panic");
+    }
+
+    #[test]
+    fn panic_is_written_to_configured_log() {
+        let path =
+            std::env::temp_dir().join(format!("lan-mouse-panic-{}.log", uuid::Uuid::new_v4()));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::panic_logging_child", "--nocapture"])
+            .env("LAN_MOUSE_PANIC_LOG_TEST", "1")
+            .env("LAN_MOUSE_LOG_FILE", &path)
+            .env("LAN_MOUSE_LOG_LEVEL", "error")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "child must actually panic");
+        let log = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            log.contains("lan-mouse regression panic"),
+            "panic was lost: {log}"
+        );
+        assert!(
+            log.contains("src/main.rs") || log.contains("src\\main.rs"),
+            "panic location missing: {log}"
+        );
+        assert!(log.contains("backtrace:"), "backtrace missing: {log}");
     }
 }
 

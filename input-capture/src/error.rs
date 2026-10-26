@@ -25,6 +25,9 @@ use core_graphics::base::CGError;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
+    #[cfg(windows)]
+    #[error("windows capture error: `{0}`")]
+    Windows(#[from] windows::core::Error),
     #[error("activation stream closed unexpectedly")]
     ActivationClosed,
     #[error("libei stream was closed")]

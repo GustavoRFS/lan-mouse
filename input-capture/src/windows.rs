@@ -20,17 +20,17 @@ pub struct WindowsInputCapture {
 #[async_trait]
 impl Capture for WindowsInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.event_thread.create(pos);
+        self.event_thread.create(pos)?;
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.event_thread.destroy(pos);
+        self.event_thread.destroy(pos)?;
         Ok(())
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        self.event_thread.release_capture();
+        self.event_thread.release_capture()?;
         Ok(())
     }
 

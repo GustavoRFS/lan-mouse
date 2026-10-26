@@ -52,6 +52,20 @@ sequenceDiagram
 ```
 
 ## Problems
+
+### Windows crash diagnostics
+
+Set `LAN_MOUSE_LOG_FILE` to a writable file path before launching Lan Mouse.
+The GUI and daemon append their logs there, including Rust panic messages,
+source locations, and backtraces even when the app runs without a console.
+`LAN_MOUSE_LOG_LEVEL` must allow `error` messages (the default does).
+Keep the matching executable and PDB when diagnosing release backtraces;
+stripped builds may contain addresses instead of function names.
+
+The Windows capture worker creates its Win32 message queue before publishing
+its thread ID. Without that ordering, activating a client immediately after
+startup can fail with `ERROR_INVALID_THREAD_ID` from `PostThreadMessageW`.
+
 The general Idea is to have a bidirectional connection by default, meaning
 any connected device can not only receive events but also send events back.
 

@@ -19,11 +19,12 @@ use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -50,40 +51,72 @@ impl EventThread {
         }
     }
 
-    pub(crate) fn release_capture(&self) {
-        self.signal(RequestType::Release);
+    pub(crate) fn release_capture(&self) -> windows::core::Result<()> {
+        self.signal(RequestType::Release)
     }
 
-    pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+    pub(crate) fn create(&self, pos: Position) -> windows::core::Result<()> {
+        self.client_update(ClientUpdate::Create(pos))
     }
 
-    pub(crate) fn destroy(&self, pos: Position) {
-        self.client_update(ClientUpdate::Destroy(pos));
+    pub(crate) fn destroy(&self, pos: Position) -> windows::core::Result<()> {
+        self.client_update(ClientUpdate::Destroy(pos))
     }
 
-    fn exit(&self) {
-        self.signal(RequestType::Exit);
+    #[cfg(test)]
+    fn exit(&self) -> windows::core::Result<()> {
+        self.signal(RequestType::Exit)
     }
 
-    fn client_update(&self, request: ClientUpdate) {
+    fn client_update(&self, request: ClientUpdate) -> windows::core::Result<()> {
         {
             let mut requests = self.request_buffer.lock().unwrap();
             requests.push(request);
         }
-        self.signal(RequestType::ClientUpdate);
+        self.signal(RequestType::ClientUpdate)
     }
 
-    fn signal(&self, event_type: RequestType) {
+    fn signal(&self, event_type: RequestType) -> windows::core::Result<()> {
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) }
     }
 }
 
 impl Drop for EventThread {
     fn drop(&mut self) {
-        self.exit();
-        let _ = self.thread.take().expect("thread").join();
+        self.shutdown_with(|id| unsafe {
+            PostThreadMessageW(id, WM_USER, WPARAM(RequestType::Exit as usize), LPARAM(0))
+        });
+    }
+}
+
+impl EventThread {
+    fn shutdown_with(&mut self, mut post_exit: impl FnMut(u32) -> windows::core::Result<()>) {
+        let Some(worker) = self.thread.as_ref() else {
+            return;
+        };
+        let mut logged_error = false;
+        loop {
+            match post_exit(self.thread_id) {
+                Ok(()) => break,
+                Err(err) if worker.is_finished() => {
+                    log::warn!("capture thread {} already exited: {err}", self.thread_id);
+                    break;
+                }
+                Err(err) => {
+                    if !logged_error {
+                        log::warn!("waiting to stop capture thread {}: {err}", self.thread_id);
+                        logged_error = true;
+                    }
+                    // The worker drains its queue. Retry until it can accept
+                    // Exit rather than leave its global input hooks installed.
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        if let Some(worker) = self.thread.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -98,8 +131,11 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
+fn blocking_send_event(pos: Position, event: CaptureEvent) -> bool {
+    EVENT_TX.with_borrow_mut(|tx| match tx.as_mut() {
+        Some(tx) => tx.blocking_send((pos, event)).is_ok(),
+        None => false,
+    })
 }
 
 fn try_send_event(
@@ -107,6 +143,143 @@ fn try_send_event(
     event: CaptureEvent,
 ) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
     EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::ManuallyDrop;
+    use std::time::{Duration, Instant};
+    use windows::Win32::UI::WindowsAndMessaging::WM_NULL;
+
+    #[test]
+    fn newly_started_thread_accepts_messages_immediately() {
+        for _ in 0..128 {
+            let (tx, _rx) = tokio::sync::mpsc::channel(10);
+            let mut worker = ManuallyDrop::new(EventThread::new(tx));
+            let initial_post =
+                unsafe { PostThreadMessageW(worker.thread_id, WM_NULL, WPARAM(0), LPARAM(0)) };
+
+            // Clean up even on the old implementation, whose constructor can
+            // return before the worker has a queue. Never panic in its Drop.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while unsafe {
+                PostThreadMessageW(
+                    worker.thread_id,
+                    WM_USER,
+                    WPARAM(RequestType::Exit as usize),
+                    LPARAM(0),
+                )
+            }
+            .is_err()
+            {
+                assert!(Instant::now() < deadline, "worker did not initialize");
+                thread::yield_now();
+            }
+            worker.thread.take().unwrap().join().unwrap();
+            assert!(
+                initial_post.is_ok(),
+                "constructor returned before queue existed: {initial_post:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signaling_an_exited_thread_does_not_panic() {
+        let id = thread::spawn(|| unsafe { GetCurrentThreadId() })
+            .join()
+            .unwrap();
+        let worker = ManuallyDrop::new(EventThread {
+            request_buffer: Default::default(),
+            thread: None,
+            thread_id: id,
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker.signal(RequestType::Release)
+        }));
+        assert!(
+            outcome.is_ok(),
+            "posting failure must be returned, not panic"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "an exited thread cannot accept messages"
+        );
+    }
+
+    #[test]
+    fn blocking_send_to_closed_receiver_does_not_panic() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        EVENT_TX.replace(Some(tx));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            blocking_send_event(Position::Right, CaptureEvent::Begin)
+        }));
+        EVENT_TX.replace(None);
+        assert!(
+            matches!(outcome, Ok(false)),
+            "a closed receiver must be reported without panicking"
+        );
+    }
+
+    #[test]
+    fn drop_retries_exit_after_a_transient_queue_full_error() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            unsafe {
+                let mut msg = MSG::default();
+                let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+                ready_tx.send(GetCurrentThreadId()).unwrap();
+            }
+            while let Some(msg) = get_msg() {
+                if msg.message == WM_USER && msg.wParam.0 == RequestType::Exit as usize {
+                    break;
+                }
+            }
+            finished_tx.send(()).unwrap();
+        });
+        let id = ready_rx.recv().unwrap();
+        let mut worker = EventThread {
+            request_buffer: Default::default(),
+            thread: Some(thread),
+            thread_id: id,
+        };
+        let mut attempts = 0;
+        worker.shutdown_with(|thread_id| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x80070718_u32 as i32,
+                )))
+            } else {
+                unsafe {
+                    PostThreadMessageW(
+                        thread_id,
+                        WM_USER,
+                        WPARAM(RequestType::Exit as usize),
+                        LPARAM(0),
+                    )
+                }
+            }
+        });
+        assert_eq!(attempts, 2, "shutdown retries transient posting failures");
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(worker);
+    }
+
+    #[test]
+    fn drop_joins_an_already_exited_worker() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let worker = EventThread::new(tx);
+        worker.exit().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.thread.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "worker did not exit");
+            thread::yield_now();
+        }
+        drop(worker);
+    }
 }
 
 thread_local! {
@@ -161,6 +334,13 @@ fn start_routine(
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
+    // PostThreadMessage fails until the target thread has a message queue.
+    // Force its creation before publishing the ID to the constructor; merely
+    // having a running thread is not sufficient (ERROR_INVALID_THREAD_ID).
+    unsafe {
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+    }
     /* communicate thread id */
     {
         let (cnd, mtx) = &*ready;
@@ -299,7 +479,12 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    if !blocking_send_event(active, CaptureEvent::Begin) {
+        // The receiver can close while the hook worker is handling its final
+        // input event. Stop capturing and let this event reach local apps.
+        ACTIVE_CLIENT.take();
+        return false;
+    }
 
     ret
 }
