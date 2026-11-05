@@ -1,13 +1,16 @@
 use crate::error::EmulationError;
 
-use super::{Emulation, error::WlrootsEmulationCreationError};
+use super::{Emulation, EmulationOptions, error::WlrootsEmulationCreationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
+use rustix::fs::{MemfdFlags, memfd_create};
 use std::collections::HashMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
@@ -24,6 +27,8 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1 as Vk,
 };
 
+use xkbcommon::xkb;
+
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
@@ -35,8 +40,14 @@ use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use super::EmulationHandle;
 use super::error::WaylandBindError;
 
+/// What `zwp_virtual_keyboard_v1::keymap` takes: the format, a file holding the keymap and its size.
+type Keymap = (u32, OwnedFd, u32);
+
 struct State {
-    keymap: Option<(u32, OwnedFd, u32)>,
+    /// the compositor's keymap, as of the last time it sent one
+    keymap: Option<Keymap>,
+    /// keymap built from the configured layout, which takes the compositor's place
+    fixed_keymap: Option<Keymap>,
     /// shared by all clients, so the keymap fd is sent once instead of once per client
     keyboard: Option<Vk>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
@@ -54,7 +65,7 @@ pub(crate) struct WlrootsEmulation {
 }
 
 impl WlrootsEmulation {
-    pub(crate) fn new() -> Result<Self, WlrootsEmulationCreationError> {
+    pub(crate) fn new(options: &EmulationOptions) -> Result<Self, WlrootsEmulationCreationError> {
         let conn = Connection::connect_to_env()?;
         let (globals, queue) = registry_queue_init::<State>(&conn)?;
         let qh = queue.handle();
@@ -71,11 +82,25 @@ impl WlrootsEmulation {
             .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
 
         let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
+        let fixed_keymap = options.keyboard_layout.as_deref().and_then(|layout| {
+            let variant = options.keyboard_variant.as_deref().unwrap_or_default();
+            match fixed_keymap(layout, variant) {
+                Ok(keymap) => {
+                    log::info!("virtual keyboard uses the fixed layout `{layout}` `{variant}`");
+                    Some(keymap)
+                }
+                Err(e) => {
+                    log::error!("{e}, using the compositor's keymap instead");
+                    None
+                }
+            }
+        });
 
         let mut emulate = WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
+                fixed_keymap,
                 keyboard: None,
                 input_for_client,
                 seat,
@@ -85,7 +110,7 @@ impl WlrootsEmulation {
             },
             queue,
         };
-        while emulate.state.keymap.is_none() {
+        while emulate.state.keymap.is_none() && emulate.state.fixed_keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
         }
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
@@ -104,7 +129,8 @@ impl State {
             None => {
                 let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
                 // TODO: use server side keymap
-                let Some((format, fd, size)) = self.keymap.as_ref() else {
+                let Some((format, fd, size)) = self.fixed_keymap.as_ref().or(self.keymap.as_ref())
+                else {
                     panic!("no keymap");
                 };
                 keyboard.keymap(*format, fd.as_fd(), *size);
@@ -183,6 +209,51 @@ impl Emulation for WlrootsEmulation {
     async fn terminate(&mut self) {
         /* nothing to do */
     }
+}
+
+#[derive(Debug, Error)]
+enum KeymapError {
+    #[error("xkb has no keymap for layout `{layout}` with variant `{variant}`")]
+    Unknown { layout: String, variant: String },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// A keymap holding just this layout, which makes it group 0 for good.
+fn fixed_keymap(layout: &str, variant: &str) -> Result<Keymap, KeymapError> {
+    let text = keymap_text(layout, variant).ok_or_else(|| KeymapError::Unknown {
+        layout: layout.to_owned(),
+        variant: variant.to_owned(),
+    })?;
+    Ok(keymap_file(&text)?)
+}
+
+fn keymap_text(layout: &str, variant: &str) -> Option<String> {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_names(
+        &context,
+        "",
+        "",
+        layout,
+        variant,
+        None,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )?;
+    Some(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
+}
+
+/// The compositor reads the keymap as a C string, and the protocol counts the terminating NUL
+/// in the size.
+fn keymap_file(text: &str) -> io::Result<Keymap> {
+    let mut file = File::from(memfd_create("lan-mouse-keymap", MemfdFlags::CLOEXEC)?);
+    file.write_all(text.as_bytes())?;
+    file.write_all(&[0])?;
+    let size = u32::try_from(text.len() + 1).map_err(io::Error::other)?;
+    Ok((
+        u32::from(wl_keyboard::KeymapFormat::XkbV1),
+        file.into(),
+        size,
+    ))
 }
 
 struct VirtualInput {
@@ -378,5 +449,71 @@ impl XMods {
 
     fn mask_pressed(&self) -> XMods {
         *self & (XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// evdev's KEY_SEMICOLON, the key right of L, plus the offset xkb adds to evdev codes
+    const KEY_RIGHT_OF_L: u32 = 39 + 8;
+
+    fn keymap_of(text: &str) -> xkb::Keymap {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        xkb::Keymap::new_from_string(
+            &context,
+            text.to_owned(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the keymap parses back")
+    }
+
+    fn keysym_right_of_l(layout: &str) -> String {
+        let keymap = keymap_of(&keymap_text(layout, "").expect("layout exists"));
+        let state = xkb::State::new(&keymap);
+        xkb::keysym_get_name(state.key_get_one_sym(KEY_RIGHT_OF_L.into()))
+    }
+
+    #[test]
+    fn spanish_types_enye_where_abnt2_types_c_cedilla() {
+        assert_eq!(keysym_right_of_l("es"), "ntilde");
+        assert_eq!(keysym_right_of_l("br"), "ccedilla");
+    }
+
+    #[test]
+    fn fixed_keymap_holds_a_single_layout() {
+        let keymap = keymap_of(&keymap_text("es", "").unwrap());
+        assert_eq!(keymap.num_layouts(), 1);
+    }
+
+    #[test]
+    fn variant_is_applied() {
+        assert!(keymap_text("es", "dvorak").is_some());
+        assert!(keymap_text("es", "no-such-variant").is_none());
+    }
+
+    #[test]
+    fn unknown_layout_has_no_keymap() {
+        assert!(keymap_text("zz", "").is_none());
+        assert!(matches!(
+            fixed_keymap("zz", ""),
+            Err(KeymapError::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn keymap_file_is_nul_terminated() {
+        let (format, fd, size) = keymap_file("xkb_keymap {}").unwrap();
+        assert_eq!(format, 1, "xkb_v1");
+        assert_eq!(size, 14);
+
+        let mut file = File::from(fd);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"xkb_keymap {}\0");
     }
 }

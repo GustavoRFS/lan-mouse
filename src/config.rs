@@ -70,6 +70,8 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     clipboard_sharing: Option<bool>,
+    keyboard_layout: Option<String>,
+    keyboard_variant: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -485,6 +487,15 @@ impl Config {
             .or(self.config_toml.as_ref().and_then(|c| c.emulation_backend))
     }
 
+    /// settings for the input emulation backend
+    pub fn emulation_options(&self) -> input_emulation::EmulationOptions {
+        let config = self.config_toml.as_ref();
+        input_emulation::EmulationOptions {
+            keyboard_layout: config.and_then(|c| c.keyboard_layout.clone()),
+            keyboard_variant: config.and_then(|c| c.keyboard_variant.clone()),
+        }
+    }
+
     /// the port to use (initially)
     pub fn port(&self) -> u16 {
         self.args
@@ -606,5 +617,30 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_layout_comes_from_the_config_file() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+            keyboard_layout = "es"
+            keyboard_variant = "dvorak"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.keyboard_layout.as_deref(), Some("es"));
+        assert_eq!(config.keyboard_variant.as_deref(), Some("dvorak"));
+    }
+
+    #[test]
+    fn keyboard_layout_defaults_to_the_compositor_keymap() {
+        let config: ConfigToml = toml::from_str("port = 4242").unwrap();
+        assert_eq!(config.keyboard_layout, None);
+        assert_eq!(config.keyboard_variant, None);
     }
 }
