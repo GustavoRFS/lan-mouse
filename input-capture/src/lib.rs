@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures_core::Stream;
 
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, MonitorDescriptor, MonitorId, scancode};
 
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
@@ -29,6 +29,8 @@ mod windows;
 
 #[cfg(x11)]
 mod x11;
+
+mod output_geometry;
 
 /// fallback input capture (does not produce events)
 mod dummy;
@@ -58,6 +60,21 @@ pub enum Position {
     Right,
     Top,
     Bottom,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CapturePoint {
+    pub monitor_id: Option<MonitorId>,
+    pub edge: Position,
+}
+
+impl CapturePoint {
+    pub fn directional(edge: Position) -> Self {
+        Self {
+            monitor_id: None,
+            edge,
+        }
+    }
 }
 
 impl Position {
@@ -121,48 +138,86 @@ pub struct InputCapture {
     capture: Box<dyn Capture>,
     /// keys pressed by active capture
     pressed_keys: HashSet<scancode::Linux>,
-    /// map from position to ids
-    position_map: HashMap<Position, Vec<CaptureHandle>>,
-    /// map from id to position
-    id_map: HashMap<CaptureHandle, Position>,
+    /// map from a monitor edge to the clients registered for it
+    point_map: HashMap<CapturePoint, Vec<CaptureHandle>>,
+    /// map from a client to all of its monitor edges
+    id_map: HashMap<CaptureHandle, Vec<CapturePoint>>,
     /// pending events
-    pending: VecDeque<(CaptureHandle, CaptureEvent)>,
+    pending: VecDeque<(CaptureHandle, CapturePoint, CaptureEvent)>,
 }
 
 impl InputCapture {
     /// create a new client with the given id
-    pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
+    pub async fn create(
+        &mut self,
+        id: CaptureHandle,
+        points: Vec<CapturePoint>,
+    ) -> Result<(), CaptureError> {
         assert!(!self.id_map.contains_key(&id));
 
-        self.id_map.insert(id, pos);
+        let mut unique_points = HashSet::new();
+        let mut registered = Vec::with_capacity(points.len());
+        for point in points {
+            if !unique_points.insert(point.clone()) {
+                continue;
+            }
 
-        if let Some(v) = self.position_map.get_mut(&pos) {
-            v.push(id);
-            Ok(())
-        } else {
-            self.position_map.insert(pos, vec![id]);
-            self.capture.create(pos).await
+            if let Some(handles) = self.point_map.get_mut(&point) {
+                handles.push(id);
+            } else if let Err(error) = self.capture.create(point.clone()).await {
+                let _ = self.capture.destroy(point.clone()).await;
+                for registered_point in registered {
+                    self.unregister_point(id, &registered_point).await;
+                }
+                return Err(error);
+            } else {
+                self.point_map.insert(point.clone(), vec![id]);
+            }
+            registered.push(point);
         }
+
+        self.id_map.insert(id, registered);
+        Ok(())
     }
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
+        let points = self
             .id_map
             .remove(&id)
-            .expect("no position for this handle");
+            .expect("no capture points for this handle");
 
-        log::debug!("destroying capture {id} @ {pos}");
-        let remaining = self.position_map.get_mut(&pos).expect("id vector");
-        remaining.retain(|&i| i != id);
+        let mut first_error = None;
+        for point in points {
+            log::debug!("destroying capture {id} @ {point:?}");
+            let remove_point = if let Some(handles) = self.point_map.get_mut(&point) {
+                handles.retain(|&handle| handle != id);
+                handles.is_empty()
+            } else {
+                false
+            };
 
-        log::debug!("remaining ids @ {pos}: {remaining:?}");
-        if remaining.is_empty() {
-            log::debug!("destroying capture @ {pos} - no remaining ids");
-            self.position_map.remove(&pos);
-            self.capture.destroy(pos).await?;
+            if remove_point {
+                self.point_map.remove(&point);
+                if let Err(error) = self.capture.destroy(point).await {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn unregister_point(&mut self, id: CaptureHandle, point: &CapturePoint) {
+        let remove_point = if let Some(handles) = self.point_map.get_mut(point) {
+            handles.retain(|&handle| handle != id);
+            handles.is_empty()
+        } else {
+            false
+        };
+        if remove_point {
+            self.point_map.remove(point);
+            let _ = self.capture.destroy(point.clone()).await;
+        }
     }
 
     /// release mouse
@@ -196,9 +251,14 @@ impl InputCapture {
             capture,
             id_map: Default::default(),
             pending: Default::default(),
-            position_map: Default::default(),
+            point_map: Default::default(),
             pressed_keys: HashSet::new(),
         })
+    }
+
+    /// Return the active named outputs known by this capture backend.
+    pub fn monitor_catalog(&self) -> Vec<MonitorDescriptor> {
+        self.capture.monitor_catalog()
     }
 
     /// check whether the given keys are pressed
@@ -218,7 +278,7 @@ impl InputCapture {
 }
 
 impl Stream for InputCapture {
-    type Item = Result<(CaptureHandle, CaptureEvent), CaptureError>;
+    type Item = Result<(CaptureHandle, CapturePoint, CaptureEvent), CaptureError>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -238,7 +298,7 @@ impl Stream for InputCapture {
         };
 
         // error occurred
-        let (pos, event) = match event {
+        let (point, event) = match event {
             Ok(e) => e,
             Err(e) => return Poll::Ready(Some(Err(e))),
         };
@@ -248,27 +308,24 @@ impl Stream for InputCapture {
             self.update_pressed_keys(key, state);
         }
 
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
+        let len = self.point_map.get(&point).map(|ids| ids.len()).unwrap_or(0);
 
         match len {
             0 => Poll::Pending,
             1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
+                self.point_map.get(&point).expect("no id")[0],
+                point,
                 event,
             )))),
             _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
+                let mut point_map = HashMap::new();
+                swap(&mut self.point_map, &mut point_map);
                 {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
+                    for &id in point_map.get(&point).expect("capture point") {
+                        self.pending.push_back((id, point.clone(), event));
                     }
                 }
-                swap(&mut self.position_map, &mut position_map);
+                swap(&mut self.point_map, &mut point_map);
 
                 Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
             }
@@ -277,12 +334,16 @@ impl Stream for InputCapture {
 }
 
 #[async_trait]
-trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
-    /// create a new client with the given id
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
+trait Capture: Stream<Item = Result<(CapturePoint, CaptureEvent), CaptureError>> + Unpin {
+    /// Start watching one output edge.
+    async fn create(&mut self, point: CapturePoint) -> Result<(), CaptureError>;
 
-    /// destroy the client with the given id, if it exists
-    async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;
+    /// Stop watching one output edge.
+    async fn destroy(&mut self, point: CapturePoint) -> Result<(), CaptureError>;
+
+    fn monitor_catalog(&self) -> Vec<MonitorDescriptor> {
+        Vec::new()
+    }
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
@@ -294,7 +355,7 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 async fn create_backend(
     backend: Backend,
 ) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    Box<dyn Capture<Item = Result<(CapturePoint, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
 > {
     match backend {
@@ -315,7 +376,7 @@ async fn create_backend(
 async fn create(
     backend: Option<Backend>,
 ) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    Box<dyn Capture<Item = Result<(CapturePoint, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
 > {
     if let Some(backend) = backend {
@@ -348,4 +409,104 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct MockCapture {
+        created: Arc<Mutex<Vec<CapturePoint>>>,
+        destroyed: Arc<Mutex<Vec<CapturePoint>>>,
+    }
+
+    #[async_trait]
+    impl Capture for MockCapture {
+        async fn create(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
+            self.created.lock().unwrap().push(point);
+            Ok(())
+        }
+
+        async fn destroy(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
+            self.destroyed.lock().unwrap().push(point);
+            Ok(())
+        }
+
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    impl Stream for MockCapture {
+        type Item = Result<(CapturePoint, CaptureEvent), CaptureError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    fn point(output: &str, edge: Position) -> CapturePoint {
+        CapturePoint {
+            monitor_id: Some(MonitorId::new(output.into()).unwrap()),
+            edge,
+        }
+    }
+
+    fn input_capture(mock: &MockCapture) -> InputCapture {
+        InputCapture {
+            capture: Box::new(mock.clone()),
+            pressed_keys: HashSet::new(),
+            point_map: HashMap::new(),
+            id_map: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_handle_can_register_and_destroy_multiple_monitor_edges() {
+        let mock = MockCapture::default();
+        let mut capture = input_capture(&mock);
+        let points = vec![
+            point("DP-1", Position::Left),
+            point("DP-2", Position::Right),
+        ];
+
+        capture.create(7, points.clone()).await.unwrap();
+        assert_eq!(capture.id_map.get(&7), Some(&points));
+        assert_eq!(mock.created.lock().unwrap().as_slice(), points.as_slice());
+
+        capture.destroy(7).await.unwrap();
+        assert!(capture.id_map.is_empty());
+        assert!(capture.point_map.is_empty());
+        assert_eq!(mock.destroyed.lock().unwrap().as_slice(), points.as_slice());
+    }
+
+    #[tokio::test]
+    async fn shared_capture_point_lives_until_its_last_handle_is_removed() {
+        let mock = MockCapture::default();
+        let mut capture = input_capture(&mock);
+        let shared = point("DP-1", Position::Right);
+
+        capture.create(1, vec![shared.clone()]).await.unwrap();
+        capture.create(2, vec![shared.clone()]).await.unwrap();
+        assert_eq!(mock.created.lock().unwrap().as_slice(), &[shared.clone()]);
+
+        capture.destroy(1).await.unwrap();
+        assert!(mock.destroyed.lock().unwrap().is_empty());
+        assert_eq!(capture.point_map.get(&shared), Some(&vec![2]));
+
+        capture.destroy(2).await.unwrap();
+        assert_eq!(mock.destroyed.lock().unwrap().as_slice(), &[shared]);
+    }
 }

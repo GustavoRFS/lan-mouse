@@ -42,7 +42,7 @@ use input_event::Event;
 use crate::CaptureEvent;
 
 use super::{
-    Capture as LanMouseInputCapture, Position,
+    Capture as LanMouseInputCapture, CapturePoint, Position,
     error::{CaptureError, LibeiCaptureCreationError},
 };
 
@@ -609,18 +609,18 @@ async fn handle_ei_event(
 
 #[async_trait]
 impl LanMouseInputCapture for LibeiInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture
-            .send(LibeiNotifyEvent::Create(pos))
+            .send(LibeiNotifyEvent::Create(point.edge))
             .await;
         Ok(())
     }
 
-    async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn destroy(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture
-            .send(LibeiNotifyEvent::Destroy(pos))
+            .send(LibeiNotifyEvent::Destroy(point.edge))
             .await;
         Ok(())
     }
@@ -655,7 +655,7 @@ impl Drop for LibeiInputCapture {
 }
 
 impl Stream for LibeiInputCapture {
-    type Item = Result<(Position, CaptureEvent), CaptureError>;
+    type Item = Result<(CapturePoint, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         match self.capture_task.poll_unpin(cx) {
@@ -663,7 +663,9 @@ impl Stream for LibeiInputCapture {
                 Ok(()) => Poll::Ready(None),
                 Err(e) => Poll::Ready(Some(Err(e))),
             },
-            Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
+            Poll::Pending => self.event_rx.poll_recv(cx).map(|event| {
+                event.map(|(edge, event)| Ok((CapturePoint::directional(edge), event)))
+            }),
         }
     }
 }

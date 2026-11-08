@@ -88,14 +88,14 @@ Owning checks: `route_uses_exact_source_monitor_and_edge`, `entry_midpoint_uses_
 - Windows output enumeration returns stable device IDs together with current rectangles. `display_util::entered_barrier` returns the source display ID and edge.
 - Hyprland uses `OutputInfo.name` as the output ID and creates/selects layer-shell edge surfaces per output and edge, preserving the existing suppression of edges shared by local outputs.
 
-- [ ] Add portable geometry tests showing the Windows barrier identifies the source monitor and does not classify movement between local displays as a remote edge.
-- [ ] Run the geometry tests on Windows and `gauss`; confirm they fail because the result has no monitor identity.
-- [ ] Add output-selection tests showing a Hyprland output edge does not activate the same-direction edge on another output.
-- [ ] Run the output-selection tests on Windows and `gauss`; confirm they fail because output identity is discarded.
-- [ ] Update the common capture map and platform backends to use `CapturePoint`; keep legacy backends functional with `monitor_id: None`.
-- [ ] Preserve multiple points for one client handle without duplicating handles or losing which point emitted an event.
-- [ ] Run affected `input-capture` tests and `cargo check -p input-capture` on Windows and `gauss`; each host checks its native backend.
-- [ ] Commit as `feat: capture per-monitor screen edges`.
+- [x] Add portable geometry tests showing the Windows barrier identifies the source monitor and does not classify movement between local displays as a remote edge.
+- [x] Run the geometry tests on Windows and `gauss`; confirm they fail because the result has no monitor identity.
+- [x] Add output-selection tests showing a Hyprland output edge does not activate the same-direction edge on another output.
+- [x] Run the output-selection tests on Windows and `gauss`; confirm they fail because output identity is discarded.
+- [x] Update the common capture map and platform backends to use `CapturePoint`; keep legacy backends functional with `monitor_id: None`.
+- [x] Preserve multiple points for one client handle without duplicating handles or losing which point emitted an event.
+- [x] Run affected `input-capture` tests and `cargo check -p input-capture` on Windows and `gauss`; each host checks its native backend.
+- [x] Commit as `feat: capture per-monitor screen edges`.
 
 ### Task 3: Persist, discover, and route synchronized layouts
 

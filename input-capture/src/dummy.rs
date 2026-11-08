@@ -8,7 +8,7 @@ use futures_core::Stream;
 use input_event::PointerEvent;
 use tokio::time::{self, Instant, Interval};
 
-use super::{Capture, CaptureError, CaptureEvent, Position};
+use super::{Capture, CaptureError, CaptureEvent, CapturePoint, Position};
 
 pub struct DummyInputCapture {
     start: Option<Instant>,
@@ -34,11 +34,11 @@ impl Default for DummyInputCapture {
 
 #[async_trait]
 impl Capture for DummyInputCapture {
-    async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+    async fn create(&mut self, _point: CapturePoint) -> Result<(), CaptureError> {
         Ok(())
     }
 
-    async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+    async fn destroy(&mut self, _point: CapturePoint) -> Result<(), CaptureError> {
         Ok(())
     }
 
@@ -55,7 +55,7 @@ const FREQUENCY_HZ: f64 = 1.0;
 const RADIUS: f64 = 100.0;
 
 impl Stream for DummyInputCapture {
-    type Item = Result<(Position, CaptureEvent), CaptureError>;
+    type Item = Result<(CapturePoint, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let current = ready!(self.interval.poll_tick(cx));
@@ -81,6 +81,6 @@ impl Stream for DummyInputCapture {
                 }))
             }
         };
-        Poll::Ready(Some(Ok((Position::Left, event))))
+        Poll::Ready(Some(Ok((CapturePoint::directional(Position::Left), event))))
     }
 }

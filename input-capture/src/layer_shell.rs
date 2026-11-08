@@ -61,14 +61,15 @@ use wayland_client::{
     },
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent};
+use input_event::{Event, KeyboardEvent, MonitorDescriptor, MonitorId, PointerEvent};
 
 use crate::{CaptureError, CaptureEvent};
 
 use super::{
-    Capture, Position,
+    Capture, CapturePoint, Position,
     error::{LayerShellCaptureCreationError, WaylandBindError},
 };
+use crate::output_geometry::{OutputGeometry, select_output_ids};
 
 struct Globals {
     compositor: wl_compositor::WlCompositor,
@@ -113,7 +114,7 @@ struct OutputInfo {
 }
 
 struct State {
-    active_positions: HashSet<Position>,
+    active_points: HashSet<CapturePoint>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
@@ -125,7 +126,7 @@ struct State {
     globals: Globals,
     read_guard: Option<ReadEventsGuard>,
     qh: QueueHandle<Self>,
-    pending_events: VecDeque<(Position, CaptureEvent)>,
+    pending_events: VecDeque<(CapturePoint, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
 }
@@ -147,7 +148,7 @@ struct Window {
     buffer: wl_buffer::WlBuffer,
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
-    pos: Position,
+    point: CapturePoint,
 }
 
 impl Window {
@@ -155,13 +156,13 @@ impl Window {
         state: &State,
         qh: &QueueHandle<State>,
         output: &WlOutput,
-        pos: Position,
+        point: &CapturePoint,
         size: (i32, i32),
     ) -> Window {
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
-        let (width, height) = match pos {
+        let (width, height) = match point.edge {
             Position::Left | Position::Right => (1, size.1 as u32),
             Position::Top | Position::Bottom => (size.0 as u32, 1),
         };
@@ -189,7 +190,7 @@ impl Window {
             qh,
             (),
         );
-        let anchor = match pos {
+        let anchor = match point.edge {
             Position::Left => Anchor::Left,
             Position::Right => Anchor::Right,
             Position::Top => Anchor::Top,
@@ -203,7 +204,7 @@ impl Window {
         surface.set_input_region(None);
         surface.commit();
         Window {
-            pos,
+            point: point.clone(),
             buffer,
             surface,
             layer_surface,
@@ -220,36 +221,32 @@ impl Drop for Window {
     }
 }
 
-fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
-    outputs
-        .iter()
-        .filter_map(|output| {
-            output.info.as_ref().map(|info| {
-                (
-                    output.clone(),
-                    match pos {
-                        Position::Left => info.position.0,
-                        Position::Right => info.position.0 + info.size.0,
-                        Position::Top => info.position.1,
-                        Position::Bottom => info.position.1 + info.size.1,
-                    },
-                )
-            })
-        })
-        .collect()
+fn output_geometry(output: &Output) -> Option<OutputGeometry> {
+    let info = output.info.as_ref()?;
+    Some(OutputGeometry {
+        id: MonitorId::new(info.name.clone()).ok()?,
+        label: info.description.clone(),
+        x: info.position.0,
+        y: info.position.1,
+        width: info.size.0,
+        height: info.size.1,
+    })
 }
 
-fn get_output_configuration(state: &State, pos: Position) -> Vec<Output> {
-    // get all output edges corresponding to the position
-    let edges = get_edges(&state.outputs, pos);
-    let opposite_edges = get_edges(&state.outputs, pos.opposite());
-
-    // remove those edges that are at the same position
-    // as an opposite edge of a different output
-    edges
+fn get_output_configuration(state: &State, point: &CapturePoint) -> Vec<Output> {
+    let geometry = state
+        .outputs
         .iter()
-        .filter(|(_, edge)| !opposite_edges.iter().map(|(_, e)| *e).any(|e| &e == edge))
-        .map(|(o, _)| o.clone())
+        .filter_map(output_geometry)
+        .collect::<Vec<_>>();
+    let selected_ids = select_output_ids(&geometry, point);
+    state
+        .outputs
+        .iter()
+        .filter(|output| {
+            output_geometry(output).is_some_and(|geometry| selected_ids.contains(&geometry.id))
+        })
+        .cloned()
         .collect()
 }
 
@@ -311,7 +308,7 @@ impl LayerShellInputCapture {
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
 
         let mut state = State {
-            active_positions: Default::default(),
+            active_points: Default::default(),
             pointer: None,
             keyboard: None,
             global_list,
@@ -360,15 +357,31 @@ impl LayerShellInputCapture {
         Ok(LayerShellInputCapture(inner))
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.0.get_mut().state.add_client(pos);
+    fn monitor_catalog(&self) -> Vec<MonitorDescriptor> {
+        self.0
+            .get_ref()
+            .state
+            .outputs
+            .iter()
+            .filter_map(output_geometry)
+            .filter_map(|output| output.monitor_descriptor())
+            .collect()
     }
 
-    fn delete_client(&mut self, pos: Position) {
+    fn add_client(&mut self, point: CapturePoint) {
+        self.0.get_mut().state.add_client(point);
+    }
+
+    fn delete_client(&mut self, point: CapturePoint) {
         let inner = self.0.get_mut();
-        inner.state.active_positions.remove(&pos);
+        inner.state.active_points.remove(&point);
         // remove all windows corresponding to this client
-        while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
+        while let Some(i) = inner
+            .state
+            .active_windows
+            .iter()
+            .position(|window| window.point == point)
+        {
             inner.state.active_windows.remove(i);
             inner.state.focused = None;
         }
@@ -506,12 +519,12 @@ impl State {
         }
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.active_positions.insert(pos);
-        let outputs = get_output_configuration(self, pos);
+    fn add_client(&mut self, point: CapturePoint) {
+        self.active_points.insert(point.clone());
+        let outputs = get_output_configuration(self, &point);
 
         log::info!(
-            "adding capture for position {pos} - using outputs: {:?}",
+            "adding capture for {point:?} - using outputs: {:?}",
             outputs
                 .iter()
                 .map(|o| o
@@ -523,7 +536,7 @@ impl State {
         );
         outputs.iter().for_each(|o| {
             if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
+                let window = Window::new(self, &self.qh, &o.wl_output, &point, info.size);
                 let window = Arc::new(window);
                 self.active_windows.push(window);
             }
@@ -538,9 +551,9 @@ impl State {
 
         self.active_windows.clear();
 
-        let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
-        for pos in active_positions {
-            self.add_client(pos);
+        let active_points = self.active_points.iter().cloned().collect::<Vec<_>>();
+        for point in active_points {
+            self.add_client(point);
         }
     }
 }
@@ -608,14 +621,14 @@ impl Inner {
 
 #[async_trait]
 impl Capture for LayerShellInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.add_client(pos);
+    async fn create(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
+        self.add_client(point);
         let inner = self.0.get_mut();
         Ok(inner.flush_events()?)
     }
 
-    async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.delete_client(pos);
+    async fn destroy(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
+        self.delete_client(point);
         let inner = self.0.get_mut();
         Ok(inner.flush_events()?)
     }
@@ -630,10 +643,14 @@ impl Capture for LayerShellInputCapture {
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
+
+    fn monitor_catalog(&self) -> Vec<MonitorDescriptor> {
+        LayerShellInputCapture::monitor_catalog(self)
+    }
 }
 
 impl Stream for LayerShellInputCapture {
-    type Item = Result<(Position, CaptureEvent), CaptureError>;
+    type Item = Result<(CapturePoint, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(event) = self.0.get_mut().state.pending_events.pop_front() {
@@ -737,7 +754,7 @@ impl Dispatch<WlPointer, ()> for State {
                     .active_windows
                     .iter()
                     .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
+                    .map(|w| w.point.clone())
                     .unwrap();
                 app.pending_events.push_back((pos, CaptureEvent::Begin));
             }
@@ -762,7 +779,7 @@ impl Dispatch<WlPointer, ()> for State {
             } => {
                 let window = app.focused.as_ref().unwrap();
                 app.pending_events.push_back((
-                    window.pos,
+                    window.point.clone(),
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
                         time,
                         button,
@@ -779,7 +796,7 @@ impl Dispatch<WlPointer, ()> for State {
                     app.scroll_discrete_pending = false;
                 } else {
                     app.pending_events.push_back((
-                        window.pos,
+                        window.point.clone(),
                         CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                             time,
                             axis: u32::from(axis) as u8,
@@ -792,7 +809,7 @@ impl Dispatch<WlPointer, ()> for State {
                 let window = app.focused.as_ref().unwrap();
                 app.scroll_discrete_pending = true;
                 app.pending_events.push_back((
-                    window.pos,
+                    window.point.clone(),
                     CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
                         axis: u32::from(axis) as u8,
                         value: value120,
@@ -828,7 +845,7 @@ impl Dispatch<WlKeyboard, ()> for State {
             } => {
                 if let Some(window) = window {
                     app.pending_events.push_back((
-                        window.pos,
+                        window.point.clone(),
                         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                             time,
                             key,
@@ -846,7 +863,7 @@ impl Dispatch<WlKeyboard, ()> for State {
             } => {
                 if let Some(window) = window {
                     app.pending_events.push_back((
-                        window.pos,
+                        window.point.clone(),
                         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
                             depressed: mods_depressed,
                             latched: mods_latched,
@@ -881,7 +898,7 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
             if let Some(window) = &app.focused {
                 let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
                 app.pending_events.push_back((
-                    window.pos,
+                    window.point.clone(),
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })),
                 ));
             }

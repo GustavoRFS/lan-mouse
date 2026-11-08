@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
     EnumDisplayDevicesW, EnumDisplaySettingsW,
@@ -28,11 +28,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, MonitorId,
+    PointerEvent,
     scancode::{self, Linux},
 };
 
-use super::{CaptureEvent, Position, display_util};
+use crate::output_geometry::OutputGeometry;
+
+#[cfg(test)]
+use crate::Position;
+
+use super::{CaptureEvent, CapturePoint, display_util};
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
@@ -41,7 +47,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_tx: Sender<(CapturePoint, CaptureEvent)>) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
         Self {
@@ -55,12 +61,12 @@ impl EventThread {
         self.signal(RequestType::Release)
     }
 
-    pub(crate) fn create(&self, pos: Position) -> windows::core::Result<()> {
-        self.client_update(ClientUpdate::Create(pos))
+    pub(crate) fn create(&self, point: CapturePoint) -> windows::core::Result<()> {
+        self.client_update(ClientUpdate::Create(point))
     }
 
-    pub(crate) fn destroy(&self, pos: Position) -> windows::core::Result<()> {
-        self.client_update(ClientUpdate::Destroy(pos))
+    pub(crate) fn destroy(&self, point: CapturePoint) -> windows::core::Result<()> {
+        self.client_update(ClientUpdate::Destroy(point))
     }
 
     #[cfg(test)]
@@ -127,22 +133,22 @@ enum RequestType {
 }
 
 enum ClientUpdate {
-    Create(Position),
-    Destroy(Position),
+    Create(CapturePoint),
+    Destroy(CapturePoint),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) -> bool {
+fn blocking_send_event(point: CapturePoint, event: CaptureEvent) -> bool {
     EVENT_TX.with_borrow_mut(|tx| match tx.as_mut() {
-        Some(tx) => tx.blocking_send((pos, event)).is_ok(),
+        Some(tx) => tx.blocking_send((point, event)).is_ok(),
         None => false,
     })
 }
 
 fn try_send_event(
-    pos: Position,
+    point: CapturePoint,
     event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+) -> Result<(), TrySendError<(CapturePoint, CaptureEvent)>> {
+    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((point, event)))
 }
 
 #[cfg(test)]
@@ -213,7 +219,10 @@ mod tests {
         drop(rx);
         EVENT_TX.replace(Some(tx));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            blocking_send_event(Position::Right, CaptureEvent::Begin)
+            blocking_send_event(
+                CapturePoint::directional(Position::Right),
+                CaptureEvent::Begin,
+            )
         }));
         EVENT_TX.replace(None);
         assert!(
@@ -284,17 +293,25 @@ mod tests {
 
 thread_local! {
     /// all configured clients
-    static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
+    static CLIENTS: RefCell<HashSet<CapturePoint>> = RefCell::new(HashSet::new());
     /// currently active client
-    static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
+    static ACTIVE_CLIENT: RefCell<Option<CapturePoint>> = const { RefCell::new(None) };
     /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    static EVENT_TX: RefCell<Option<Sender<(CapturePoint, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
-    static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    static DISPLAYS: RefCell<(Vec<OutputGeometry>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+}
+
+fn active_client() -> Option<CapturePoint> {
+    ACTIVE_CLIENT.with_borrow(|active| active.clone())
+}
+
+fn clear_active_client() {
+    ACTIVE_CLIENT.with_borrow_mut(Option::take);
 }
 
 fn get_msg() -> Option<MSG> {
@@ -310,7 +327,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<(CapturePoint, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
@@ -330,7 +347,7 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<(CapturePoint, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
@@ -409,7 +426,7 @@ fn start_routine(
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
+                    clear_active_client();
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -439,7 +456,7 @@ fn start_routine(
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     if wparam.0 != WM_MOUSEMOVE as usize {
-        return ACTIVE_CLIENT.get().is_some();
+        return active_client().is_some();
     }
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
     let curr_pos = (mouse_low_level.pt.x, mouse_low_level.pt.y);
@@ -447,10 +464,10 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     PREV_POS.replace(Some(curr_pos));
 
     /* next event is the first actual event */
-    let ret = ACTIVE_CLIENT.get().is_some();
+    let ret = active_client().is_some();
 
     /* client already active, no need to check */
-    if ACTIVE_CLIENT.get().is_some() {
+    if ret {
         return ret;
     }
 
@@ -460,17 +477,22 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         display_util::entered_barrier(prev_pos, curr_pos, displays)
     });
 
-    let Some(pos) = entered else {
+    let Some(entered_point) = entered else {
         return ret;
     };
 
-    /* check if a client is registered for the barrier */
-    if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
+    /* exact monitor registrations take precedence over direction-only ones */
+    let Some(point) = CLIENTS.with_borrow(|clients| {
+        clients.get(&entered_point).cloned().or_else(|| {
+            let directional = CapturePoint::directional(entered_point.edge);
+            clients.contains(&directional).then_some(directional)
+        })
+    }) else {
         return ret;
-    }
+    };
 
     /* update active client and entry point */
-    ACTIVE_CLIENT.replace(Some(pos));
+    ACTIVE_CLIENT.with_borrow_mut(|active| *active = Some(point.clone()));
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
@@ -478,11 +500,11 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
+    let active = active_client().expect("active client");
     if !blocking_send_event(active, CaptureEvent::Begin) {
         // The receiver can close while the hook worker is handling its final
         // input event. Stop capturing and let this event reach local apps.
-        ACTIVE_CLIENT.take();
+        clear_active_client();
         return false;
     }
 
@@ -498,7 +520,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     }
 
     /* get active client if any */
-    let Some(pos) = ACTIVE_CLIENT.get() else {
+    let Some(point) = active_client() else {
         return LRESULT(1);
     };
 
@@ -508,7 +530,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
+    if let Err(e) = try_send_event(point, CaptureEvent::Input(Event::Pointer(pointer_event))) {
         log::warn!("e: {e}");
     }
 
@@ -518,7 +540,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     /* get active client if any */
-    let Some(client) = ACTIVE_CLIENT.get() else {
+    let Some(client) = active_client() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
 
@@ -550,17 +572,17 @@ unsafe extern "system" fn window_proc(
 
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
 
-fn update_display_regions(displays: &mut Vec<RECT>, generation: &mut i32) {
+fn update_display_regions(displays: &mut Vec<OutputGeometry>, generation: &mut i32) {
     let global_generation = DISPLAY_RESOLUTION_GENERATION.load(Ordering::Acquire);
     if *generation != global_generation {
-        enumerate_displays(displays);
+        *displays = enumerate_displays();
         log::debug!("displays: {displays:?}");
         *generation = global_generation;
     }
 }
 
-fn enumerate_displays(display_rects: &mut Vec<RECT>) {
-    display_rects.clear();
+pub(crate) fn enumerate_displays() -> Vec<OutputGeometry> {
+    let mut display_regions = Vec::new();
     unsafe {
         let mut devices = vec![];
         for i in 0.. {
@@ -574,47 +596,96 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
                 .StateFlags
                 .contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
             {
-                devices.push(device.DeviceName);
+                let mut monitor: DISPLAY_DEVICEW = std::mem::zeroed();
+                monitor.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+                let monitor_found = EnumDisplayDevicesW(
+                    PCWSTR::from_raw(device.DeviceName.as_ptr()),
+                    0,
+                    &mut monitor,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                ) != FALSE;
+                let display_name = wide_string(&device.DeviceName);
+                let device_id = if monitor_found {
+                    wide_string(&monitor.DeviceID)
+                } else {
+                    String::new()
+                };
+                let id =
+                    MonitorId::new(device_id).or_else(|_| MonitorId::new(display_name.clone()));
+                let label = if monitor_found {
+                    wide_string(&monitor.DeviceString)
+                } else {
+                    wide_string(&device.DeviceString)
+                };
+                if let Ok(id) = id {
+                    devices.push((id, display_name, device.DeviceName, label));
+                }
             }
         }
-        for device in devices {
+        for (id, display_name, device_name_wide, label) in devices {
             let mut dev_mode: DEVMODEW = std::mem::zeroed();
             dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
             let ret = EnumDisplaySettingsW(
-                PCWSTR::from_raw(&device as *const _),
+                PCWSTR::from_raw(device_name_wide.as_ptr()),
                 ENUM_CURRENT_SETTINGS,
                 &mut dev_mode,
             );
             if ret == FALSE {
                 log::warn!("no display mode");
+                continue;
             }
 
             let pos = dev_mode.Anonymous1.Anonymous2.dmPosition;
             let (x, y) = (pos.x, pos.y);
             let (width, height) = (dev_mode.dmPelsWidth, dev_mode.dmPelsHeight);
 
-            display_rects.push(RECT {
-                left: x,
-                right: x + width as i32,
-                top: y,
-                bottom: y + height as i32,
+            let label = if label.is_empty() {
+                display_name
+            } else {
+                label
+            };
+            display_regions.push(OutputGeometry {
+                id,
+                label: truncate_utf8(&label, input_event::MAX_MONITOR_LABEL_BYTES),
+                x,
+                y,
+                width: width as i32,
+                height: height as i32,
             });
         }
     }
+    display_regions
+}
+
+fn wide_string(value: &[u16]) -> String {
+    let len = value
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..len])
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn update_clients(request: ClientUpdate) {
     match request {
-        ClientUpdate::Create(pos) => {
-            CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
+        ClientUpdate::Create(point) => {
+            CLIENTS.with_borrow_mut(|clients| clients.insert(point));
         }
-        ClientUpdate::Destroy(pos) => {
-            if let Some(active_pos) = ACTIVE_CLIENT.get() {
-                if pos == active_pos {
-                    let _ = ACTIVE_CLIENT.take();
-                }
+        ClientUpdate::Destroy(point) => {
+            if active_client().as_ref() == Some(&point) {
+                clear_active_client();
             }
-            CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
+            CLIENTS.with_borrow_mut(|clients| clients.remove(&point));
         }
     }
 }

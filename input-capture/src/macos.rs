@@ -1,4 +1,6 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, CapturePoint, Position, error::MacosCaptureCreationError,
+};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
@@ -763,21 +765,21 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
+            log::debug!("creating capture, {}", point.edge);
+            let _ = notify_tx.send(ProducerEvent::Create(point.edge)).await;
             log::debug!("done !");
         });
         Ok(())
     }
 
-    async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn destroy(&mut self, point: CapturePoint) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
+            log::debug!("destroying capture {}", point.edge);
+            let _ = notify_tx.send(ProducerEvent::Destroy(point.edge)).await;
             log::debug!("done !");
         });
         Ok(())
@@ -798,12 +800,12 @@ impl Capture for MacOSInputCapture {
 }
 
 impl Stream for MacOSInputCapture {
-    type Item = Result<(Position, CaptureEvent), CaptureError>;
+    type Item = Result<(CapturePoint, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+            Some((edge, event)) => Poll::Ready(Some(Ok((CapturePoint::directional(edge), event)))),
         }
     }
 }
