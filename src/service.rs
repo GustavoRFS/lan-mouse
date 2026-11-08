@@ -251,6 +251,14 @@ impl Service {
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
                 self.update_leave_hook(handle, leave_hook)
             }
+            FrontendRequest::UpdateAudioConfig(handle, audio) => {
+                self.client_manager.set_audio_config(handle, audio);
+                self.broadcast_client(handle);
+                self.save_config();
+            }
+            FrontendRequest::EnumerateAudioDevices => self.notify_frontend(FrontendEvent::Error(
+                "Audio device enumeration is not available yet".into(),
+            )),
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::SetClipboardSharing(enabled) => {
                 if self.clipboard_sharing != enabled {
@@ -284,6 +292,7 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                audio: c.audio,
             })
             .collect();
         self.config.set_clients(clients);

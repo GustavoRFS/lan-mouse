@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{AudioConfig, DEFAULT_PORT, Position};
 
 use input_event::scancode::{
     self,
@@ -82,6 +82,8 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    #[serde(default)]
+    audio: Option<AudioConfig>,
 }
 
 impl ConfigToml {
@@ -282,6 +284,7 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    pub audio: AudioConfig,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -289,6 +292,7 @@ impl From<TomlClient> for ConfigClient {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
         let leave_hook = toml.leave_hook;
+        let audio = toml.audio.unwrap_or_default();
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
@@ -301,6 +305,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            audio,
         }
     }
 }
@@ -321,6 +326,7 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
+        let audio = (client.audio != AudioConfig::default()).then_some(client.audio);
         Self {
             hostname,
             host_name,
@@ -330,6 +336,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            audio,
         }
     }
 }
@@ -541,10 +548,7 @@ impl Config {
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
-        self.config_toml
-            .as_mut()
-            .expect("config")
-            .clipboard_sharing = Some(enabled);
+        self.config_toml.as_mut().expect("config").clipboard_sharing = Some(enabled);
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
@@ -606,5 +610,62 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::{ConfigClient, ConfigToml};
+    use lan_mouse_ipc::{AudioConfig, AudioMode};
+
+    #[test]
+    fn legacy_toml_client_defaults_audio_to_off() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+                [[clients]]
+                hostname = "legacy-peer"
+            "#,
+        )
+        .unwrap();
+        let client = ConfigClient::from(config.clients.unwrap().into_iter().next().unwrap());
+
+        assert_eq!(client.audio.mode, AudioMode::Off);
+    }
+
+    #[test]
+    fn audio_config_toml_preserves_device_preferences() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+                [[clients]]
+                hostname = "audio-peer"
+
+                [clients.audio]
+                mode = "send"
+                send_system_audio = true
+                system_capture_device = "monitor:studio"
+                send_microphone = true
+                microphone_capture_device = "mic:usb"
+                playback_device = "speaker:desk"
+                receive_microphone = false
+            "#,
+        )
+        .unwrap();
+        let client = ConfigClient::from(config.clients.unwrap().into_iter().next().unwrap());
+        let expected = AudioConfig {
+            mode: AudioMode::Send,
+            send_system_audio: true,
+            system_capture_device: Some("monitor:studio".into()),
+            send_microphone: true,
+            microphone_capture_device: Some("mic:usb".into()),
+            playback_device: Some("speaker:desk".into()),
+            receive_microphone: false,
+        };
+
+        assert_eq!(client.audio, expected);
+        let serialized = toml::to_string(&super::TomlClient::from(client)).unwrap();
+        let reloaded =
+            ConfigClient::from(toml::from_str::<super::TomlClient>(&serialized).unwrap());
+
+        assert_eq!(reloaded.audio, expected);
     }
 }

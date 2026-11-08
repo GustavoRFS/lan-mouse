@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{AudioConfig, ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 
@@ -34,6 +34,7 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            audio: config_client.audio,
         };
         let state = ClientState {
             active: config_client.active,
@@ -55,6 +56,15 @@ impl ClientManager {
     pub fn set_config(&self, handle: ClientHandle, config: ClientConfig) {
         if let Some((c, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
             *c = config;
+        }
+    }
+
+    pub(crate) fn set_audio_config(&self, handle: ClientHandle, audio: AudioConfig) -> bool {
+        if let Some((config, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            config.audio = audio;
+            true
+        } else {
+            false
         }
     }
 
@@ -331,5 +341,30 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::ClientManager;
+    use lan_mouse_ipc::{AudioConfig, AudioMode};
+
+    #[test]
+    fn audio_config_update_changes_only_the_selected_client() {
+        let manager = ClientManager::default();
+        let first = manager.add_client();
+        let second = manager.add_client();
+        let config = AudioConfig {
+            mode: AudioMode::Send,
+            ..AudioConfig::default()
+        };
+
+        assert!(manager.set_audio_config(first, config.clone()));
+
+        let (first_config, _) = manager.get_state(first).unwrap();
+        let (second_config, _) = manager.get_state(second).unwrap();
+        assert_eq!(first_config.audio, config);
+        assert_eq!(second_config.audio, AudioConfig::default());
+        assert!(!manager.set_audio_config(u64::MAX, AudioConfig::default()));
     }
 }

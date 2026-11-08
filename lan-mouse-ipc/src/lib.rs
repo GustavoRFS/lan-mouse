@@ -126,6 +126,65 @@ impl TryFrom<&str> for Position {
     }
 }
 
+#[derive(Debug, Default, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    #[default]
+    Off,
+    Send,
+    Receive,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    pub mode: AudioMode,
+    pub send_system_audio: bool,
+    pub system_capture_device: Option<String>,
+    pub send_microphone: bool,
+    pub microphone_capture_device: Option<String>,
+    pub playback_device: Option<String>,
+    pub receive_microphone: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            mode: AudioMode::Off,
+            send_system_audio: true,
+            system_capture_device: None,
+            send_microphone: false,
+            microphone_capture_device: None,
+            playback_device: None,
+            receive_microphone: false,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub direction: AudioDeviceDirection,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioDeviceDirection {
+    Capture,
+    Playback,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioPeerStatus {
+    Off,
+    WaitingForPeer,
+    Starting,
+    Active,
+    DeviceUnavailable(String),
+    Error(String),
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// hostname of this client
@@ -140,6 +199,9 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// audio sharing preferences for this peer
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 impl Default for ClientConfig {
@@ -151,6 +213,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            audio: AudioConfig::default(),
         }
     }
 }
@@ -238,6 +301,13 @@ pub enum FrontendEvent {
         update_id: [u8; 16],
         offer: RemoteFileOffer,
     },
+    /// available local audio devices
+    AudioDevices(Vec<AudioDevice>),
+    /// audio negotiation/runtime status for a peer
+    AudioPeerStatus {
+        handle: ClientHandle,
+        status: AudioPeerStatus,
+    },
 }
 
 /// Files or folders copied on a peer. Their content stays on the peer until
@@ -295,6 +365,10 @@ pub enum FrontendRequest {
     UpdateEnterHook(u64, Option<String>),
     /// change the leave hook command
     UpdateLeaveHook(u64, Option<String>),
+    /// update audio sharing preferences for one peer
+    UpdateAudioConfig(ClientHandle, AudioConfig),
+    /// enumerate audio capture and playback devices
+    EnumerateAudioDevices,
     /// save config file
     SaveConfiguration,
     /// enable or pause clipboard sharing
@@ -363,4 +437,27 @@ pub fn is_service_running() -> bool {
 #[cfg(windows)]
 pub fn is_service_running() -> bool {
     std::net::TcpStream::connect("127.0.0.1:5252").is_ok()
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::{AudioConfig, AudioMode};
+
+    #[test]
+    fn audio_config_ipc_json_round_trips() {
+        let config = AudioConfig {
+            mode: AudioMode::Send,
+            send_system_audio: false,
+            system_capture_device: Some("monitor:studio".into()),
+            send_microphone: true,
+            microphone_capture_device: Some("mic:usb".into()),
+            playback_device: None,
+            receive_microphone: false,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(json.contains("\"send\""));
+        assert_eq!(serde_json::from_str::<AudioConfig>(&json).unwrap(), config);
+    }
 }
