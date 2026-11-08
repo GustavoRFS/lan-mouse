@@ -185,7 +185,7 @@ impl ClientRow {
         }
         .to_string();
         self.obj()
-            .emit_by_name("request-keyboard-layout-change", &[&layout]);
+            .emit_by_name::<()>("request-keyboard-layout-change", &[&layout]);
     }
 
     pub(super) fn set_hostname(&self, hostname: Option<String>) {
