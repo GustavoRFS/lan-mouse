@@ -1,3 +1,4 @@
+mod audio_settings;
 mod authorization_window;
 mod client_object;
 mod client_row;
@@ -318,6 +319,10 @@ fn build_ui(app: &Application) {
                     FrontendEvent::NoSuchClient(_) => {}
                     FrontendEvent::Error(e) => window.show_toast(e.as_str()),
                     FrontendEvent::Enumerate(clients) => window.update_client_list(clients),
+                    FrontendEvent::AudioDevices(devices) => window.update_audio_devices(devices),
+                    FrontendEvent::AudioPeerStatus { handle, status } => {
+                        window.update_audio_status(handle, status)
+                    }
                     FrontendEvent::PortChanged(port, msg) => window.update_port(port, msg),
                     FrontendEvent::CaptureStatus(s) => window.set_capture(s.into()),
                     FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),

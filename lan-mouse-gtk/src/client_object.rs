@@ -3,7 +3,7 @@ mod imp;
 use adw::subclass::prelude::*;
 use gtk::glib::{self, Object};
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState};
+use lan_mouse_ipc::{AudioConfig, ClientConfig, ClientHandle, ClientState};
 
 glib::wrapper! {
     pub struct ClientObject(ObjectSubclass<imp::ClientObject>);
@@ -11,7 +11,7 @@ glib::wrapper! {
 
 impl ClientObject {
     pub fn new(handle: ClientHandle, client: ClientConfig, state: ClientState) -> Self {
-        Object::builder()
+        let object: Self = Object::builder()
             .property("handle", handle)
             .property("hostname", client.hostname)
             .property("port", client.port as u32)
@@ -27,7 +27,9 @@ impl ClientObject {
             )
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
-            .build()
+            .build();
+        object.imp().data.borrow_mut().audio = client.audio;
+        object
     }
 
     pub fn get_data(&self) -> ClientData {
@@ -53,4 +55,5 @@ pub struct ClientData {
     pub resolving: bool,
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
+    pub audio: AudioConfig,
 }

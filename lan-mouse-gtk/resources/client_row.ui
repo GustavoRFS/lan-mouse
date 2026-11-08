@@ -69,6 +69,77 @@
 				</property>
 			</object>
 		</child>
+		<!-- audio sharing -->
+		<child>
+			<object class="AdwPreferencesGroup" id="audio_settings_group">
+				<property name="title" translatable="yes">Compartilhamento de áudio</property>
+				<child>
+					<object class="AdwComboRow" id="audio_mode">
+						<property name="title" translatable="yes">Modo</property>
+						<property name="model">
+							<object class="GtkStringList">
+								<items>
+									<item>Desativado</item>
+									<item>Enviar</item>
+									<item>Receber</item>
+								</items>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child>
+					<object class="AdwActionRow" id="send_system_audio_row">
+						<property name="title" translatable="yes">Enviar áudio do sistema</property>
+						<child>
+							<object class="GtkSwitch" id="send_system_audio_switch">
+								<property name="valign">center</property>
+							</object>
+						</child>
+					</object>
+				</child>
+				<child>
+					<object class="AdwComboRow" id="system_capture_device">
+						<property name="title" translatable="yes">Saída para capturar</property>
+					</object>
+				</child>
+				<child>
+					<object class="AdwActionRow" id="send_microphone_row">
+						<property name="title" translatable="yes">Enviar microfone</property>
+						<child>
+							<object class="GtkSwitch" id="send_microphone_switch">
+								<property name="valign">center</property>
+							</object>
+						</child>
+					</object>
+				</child>
+				<child>
+					<object class="AdwComboRow" id="microphone_capture_device">
+						<property name="title" translatable="yes">Microfone para capturar</property>
+					</object>
+				</child>
+				<child>
+					<object class="AdwComboRow" id="playback_device">
+						<property name="title" translatable="yes">Saída local</property>
+					</object>
+				</child>
+				<child>
+					<object class="AdwActionRow" id="receive_microphone_row">
+						<property name="title" translatable="yes">Disponibilizar microfone remoto</property>
+						<child>
+							<object class="GtkSwitch" id="receive_microphone_switch">
+								<property name="valign">center</property>
+							</object>
+						</child>
+					</object>
+				</child>
+				<child>
+					<object class="AdwActionRow" id="audio_status_row">
+						<property name="title" translatable="yes">Estado</property>
+						<property name="subtitle" translatable="yes">Desativado</property>
+					</object>
+				</child>
+			</object>
+		</child>
 		<!-- delete button -->
 		<child>
 			<object class="AdwActionRow" id="delete_row">

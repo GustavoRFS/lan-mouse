@@ -4,7 +4,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib::{self, Object};
 
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{AudioConfig, AudioDevice, AudioPeerStatus, DEFAULT_PORT, Position};
 
 use super::ClientObject;
 
@@ -124,6 +124,10 @@ impl ClientRow {
         bindings.push(resolve_binding);
         bindings.push(ip_binding);
 
+        let data = client_object.get_data();
+        self.set_audio_config(data.audio);
+        self.set_audio_status(AudioPeerStatus::Off);
+
         // Render the initial collapsed subtitle from whatever
         // peer_commit the ClientObject was created with. Subsequent
         // changes are pushed by `Window::update_client_state` calling
@@ -155,6 +159,25 @@ impl ClientRow {
 
     pub fn set_dns_state(&self, resolved: bool) {
         self.imp().set_dns_state(resolved);
+    }
+
+    pub fn audio_config(&self) -> AudioConfig {
+        self.imp().audio_config.borrow().clone()
+    }
+
+    pub fn set_audio_config(&self, config: AudioConfig) {
+        if let Some(client) = self.imp().client_object.borrow().as_ref() {
+            client.imp().data.borrow_mut().audio = config.clone();
+        }
+        self.imp().apply_audio_config(config);
+    }
+
+    pub fn set_audio_devices(&self, devices: Vec<AudioDevice>) {
+        self.imp().set_audio_devices(devices);
+    }
+
+    pub fn set_audio_status(&self, status: AudioPeerStatus) {
+        self.imp().set_audio_status(status);
     }
 
     /// Recompute the collapsed subtitle (Pango markup) based on the
