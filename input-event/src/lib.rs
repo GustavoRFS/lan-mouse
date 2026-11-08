@@ -1,7 +1,13 @@
 use std::fmt::{self, Display};
 
+pub mod display;
 pub mod error;
 pub mod scancode;
+
+pub use display::{
+    MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorDescriptor, MonitorDescriptorError,
+    MonitorId, MonitorIdError,
+};
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;

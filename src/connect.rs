@@ -5,7 +5,7 @@ use crate::{
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
-    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
+    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, ProtoEvent, ProtocolError,
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -38,6 +38,8 @@ pub(crate) enum LanMouseConnectionError {
     Dtls(#[from] webrtc_dtls::Error),
     #[error(transparent)]
     Webrtc(#[from] webrtc_util::Error),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
     #[error("not connected")]
     NotConnected,
     #[error("emulation is disabled on the target device")]
@@ -189,7 +191,7 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        let (buf, len) = event.encode()?;
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
             let connection = {
@@ -362,10 +364,7 @@ async fn receive_loop(
             }
             continue;
         }
-        let mut event_buf = [0u8; MAX_EVENT_SIZE];
-        let event_len = len.min(MAX_EVENT_SIZE);
-        event_buf[..event_len].copy_from_slice(&buf[..event_len]);
-        match event_buf.try_into() {
+        match ProtoEvent::decode(&buf[..len]) {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {

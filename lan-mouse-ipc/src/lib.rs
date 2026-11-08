@@ -14,6 +14,9 @@ use std::{env, path::Path};
 
 use serde::{Deserialize, Serialize};
 
+mod monitor_grid;
+pub use monitor_grid::{GridPosition, MonitorGrid, MonitorGridEntry, MonitorGridError};
+
 mod connect;
 mod connect_async;
 mod listen;

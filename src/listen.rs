@@ -1,7 +1,5 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{
-    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
-};
+use lan_mouse_proto::{ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
@@ -228,7 +226,10 @@ impl LanMouseListener {
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        let Ok((buf, len)) = event.encode() else {
+            log::warn!("refusing to send invalid protocol event to {addr}");
+            return;
+        };
         let conns = self.conns.lock().await;
         for connection in conns.iter() {
             if connection.addr == addr {
@@ -327,10 +328,7 @@ async fn read_loop(
             }
             continue;
         }
-        let mut event_buf = [0u8; MAX_EVENT_SIZE];
-        let event_len = len.min(MAX_EVENT_SIZE);
-        event_buf[..event_len].copy_from_slice(&b[..event_len]);
-        match event_buf.try_into() {
+        match ProtoEvent::decode(&b[..len]) {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),

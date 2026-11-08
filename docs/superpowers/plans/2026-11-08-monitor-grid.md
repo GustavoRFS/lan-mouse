@@ -35,8 +35,8 @@ Owning checks: `route_uses_exact_source_monitor_and_edge`, `entry_midpoint_uses_
 
 ### Preflight
 
-- [ ] Before source changes, run `cargo test -p input-event -p lan-mouse-ipc -p lan-mouse-proto -p input-capture -p input-emulation -p lan-mouse-gtk` on this Windows machine and on `gauss`; record each baseline. If either is already failing, preserve the failure details and distinguish them from this feature's results.
-- [ ] Confirm the feature worktree is clean apart from the approved design and this plan.
+- [x] Before source changes, run `cargo test -p input-event -p lan-mouse-ipc -p lan-mouse-proto -p input-capture -p input-emulation -p lan-mouse-gtk` on this Windows machine and on `gauss`; record each baseline. If either is already failing, preserve the failure details and distinguish them from this feature's results.
+- [x] Confirm the feature worktree is clean apart from the approved design and this plan.
 
 ### Task 1: Shared monitor-grid model and protocol messages
 
@@ -58,14 +58,14 @@ Owning checks: `route_uses_exact_source_monitor_and_edge`, `entry_midpoint_uses_
 - `MonitorGrid::neighbor(owner_fingerprint: &str, monitor_id: &MonitorId, edge: Position) -> Option<&MonitorGridEntry>` returns the adjacent cell, if occupied.
 - Add backward-compatible protocol events for capability exchange, catalog request/chunks, grid snapshot chunks/acknowledgment, and `EnterMonitor { monitor_id, edge }`. Keep legacy `Enter(Position)` unchanged. Keep each encoded datagram at or below 1200 bytes and reject invalid lengths/counts safely.
 
-- [ ] Add model tests for all four neighbor directions, same-owner versus remote-owner neighbors, duplicate-cell rejection, and empty-cell behavior.
-- [ ] Run the model tests on Windows and `gauss`; confirm they fail because the grid model is missing.
-- [ ] Add protocol tests for each new event's round trip, chunk ordering metadata, malformed lengths, and legacy event round trips.
-- [ ] Run the protocol tests on Windows and `gauss`; confirm they fail because the events are missing.
-- [ ] Implement the shared types and protocol event codecs with new event discriminants appended after existing ones.
-- [ ] Bound monitor IDs and labels to 96 UTF-8 bytes, and a grid to 256 displays. Keep encoded chunks within 1200 bytes and split larger snapshots into numbered chunks.
-- [ ] Run `cargo test -p lan-mouse-ipc -p lan-mouse-proto` on Windows and `gauss`; confirm all existing and new tests pass.
-- [ ] Commit as `feat: add monitor grid protocol model`.
+- [x] Add model tests for all four neighbor directions, same-owner versus remote-owner neighbors, duplicate-cell rejection, and empty-cell behavior.
+- [x] Run the model tests on Windows and `gauss`; confirm they fail because the grid model is missing.
+- [x] Add protocol tests for each new event's round trip, chunk ordering metadata, malformed lengths, and legacy event round trips.
+- [x] Run the protocol tests on Windows and `gauss`; confirm they fail because the events are missing.
+- [x] Implement the shared types and protocol event codecs with new event discriminants appended after existing ones.
+- [x] Bound monitor IDs and labels to 96 UTF-8 bytes, and a grid to 256 displays. Keep encoded chunks within 1200 bytes and split larger snapshots into numbered chunks.
+- [x] Run `cargo test -p lan-mouse-ipc -p lan-mouse-proto` on Windows and `gauss`; confirm all existing and new tests pass.
+- [x] Commit as `feat: add monitor grid protocol model`.
 
 ### Task 2: Monitor-aware edge capture on Windows and Hyprland
 

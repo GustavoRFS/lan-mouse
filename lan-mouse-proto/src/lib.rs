@@ -1,19 +1,23 @@
-use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+use input_event::{
+    Event as InputEvent, KeyboardEvent, MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES,
+    MonitorDescriptor, MonitorId, PointerEvent,
+};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{Debug, Display, Formatter},
     mem::size_of,
     time::{Duration, Instant},
 };
 use thiserror::Error;
 
-/// defines the maximum size an encoded event can take up
-/// this is currently the pointer motion event
-/// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+/// Maximum size of one protocol datagram. Input events remain at most 21 bytes;
+/// monitor catalogs and grid snapshots use bounded chunks within this limit.
+pub const MAX_EVENT_SIZE: usize = 1200;
+pub const MAX_MONITOR_CATALOG_CHUNK_ITEMS: usize = 5;
+pub const MAX_MONITOR_GRID_CHUNK_PAYLOAD: usize = 1024;
 
 /// Maximum size of a clipboard frame carried as one DTLS application datagram.
 pub const MAX_CLIPBOARD_FRAME_SIZE: usize = 1200;
@@ -76,6 +80,9 @@ pub enum ProtocolError {
     /// Keyboard layout id is not part of this protocol version.
     #[error("invalid keyboard layout id: `{0}`")]
     InvalidKeyboardLayout(u8),
+    /// A monitor-grid frame has invalid metadata, encoding, or size.
+    #[error("invalid monitor-grid protocol event")]
+    InvalidMonitorGridEvent,
 }
 
 /// Application frames for clipboard synchronization. These are deliberately
@@ -816,7 +823,7 @@ fn chunk_count(bytes: usize) -> usize {
 }
 
 /// Position of a client
-#[derive(Clone, Copy, Debug, TryFromPrimitive, IntoPrimitive)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum Position {
     Left,
@@ -858,7 +865,7 @@ impl Display for Position {
 }
 
 /// main lan-mouse protocol event type
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
@@ -887,6 +894,37 @@ pub enum ProtoEvent {
     /// Layout to use for input from this peer; `None` restores the receiver's
     /// configured or compositor keymap.
     KeyboardLayout(Option<KeyboardLayout>),
+    /// Advertise monitor-grid protocol support. Peers exchange this after
+    /// authenticating; version 1 enables monitor-specific routing.
+    MonitorGridCapabilities { version: u8 },
+    /// Request a fresh catalog of active named displays from a peer.
+    MonitorCatalogRequest,
+    /// A bounded part of an active display catalog.
+    MonitorCatalogChunk {
+        transfer_id: u32,
+        index: u16,
+        count: u16,
+        descriptors: Vec<MonitorDescriptor>,
+    },
+    /// A bounded part of a serialized, versioned monitor-grid snapshot.
+    GridSnapshotChunk {
+        revision: u64,
+        origin_fingerprint: String,
+        index: u16,
+        count: u16,
+        payload: Vec<u8>,
+    },
+    /// Acknowledge that a snapshot revision has been applied or is stale.
+    GridSnapshotAck {
+        revision: u64,
+        origin_fingerprint: String,
+    },
+    /// Enter a named output from the given edge instead of using the legacy
+    /// directional entry point.
+    EnterMonitor {
+        monitor_id: MonitorId,
+        edge: Position,
+    },
 }
 
 impl Display for ProtoEvent {
@@ -913,6 +951,41 @@ impl Display for ProtoEvent {
                 "KeyboardLayout({})",
                 layout.map_or("auto", KeyboardLayout::xkb_name)
             ),
+            ProtoEvent::MonitorGridCapabilities { version } => {
+                write!(f, "MonitorGridCapabilities({version})")
+            }
+            ProtoEvent::MonitorCatalogRequest => write!(f, "MonitorCatalogRequest"),
+            ProtoEvent::MonitorCatalogChunk {
+                transfer_id,
+                index,
+                count,
+                descriptors,
+            } => write!(
+                f,
+                "MonitorCatalogChunk({transfer_id}, {index}/{count}, {} displays)",
+                descriptors.len()
+            ),
+            ProtoEvent::GridSnapshotChunk {
+                revision,
+                index,
+                count,
+                payload,
+                ..
+            } => write!(
+                f,
+                "GridSnapshotChunk(revision {revision}, {index}/{count}, {} bytes)",
+                payload.len()
+            ),
+            ProtoEvent::GridSnapshotAck {
+                revision,
+                origin_fingerprint,
+            } => write!(
+                f,
+                "GridSnapshotAck(revision {revision}, {origin_fingerprint})"
+            ),
+            ProtoEvent::EnterMonitor { monitor_id, edge } => {
+                write!(f, "EnterMonitor({}, {edge:?})", monitor_id.as_str())
+            }
         }
     }
 }
@@ -920,19 +993,25 @@ impl Display for ProtoEvent {
 #[derive(TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum EventType {
-    PointerMotion,
-    PointerButton,
-    PointerAxis,
-    PointerAxisValue120,
-    KeyboardKey,
-    KeyboardModifiers,
-    Ping,
-    Pong,
-    Enter,
-    Leave,
-    Ack,
-    Hello,
-    KeyboardLayout,
+    PointerMotion = 0,
+    PointerButton = 1,
+    PointerAxis = 2,
+    PointerAxisValue120 = 3,
+    KeyboardKey = 4,
+    KeyboardModifiers = 5,
+    Ping = 6,
+    Pong = 7,
+    Enter = 8,
+    Leave = 9,
+    Ack = 10,
+    Hello = 11,
+    KeyboardLayout = 12,
+    MonitorGridCapabilities = 13,
+    MonitorCatalogRequest = 14,
+    MonitorCatalogChunk = 15,
+    GridSnapshotChunk = 16,
+    GridSnapshotAck = 17,
+    EnterMonitor = 18,
 }
 
 impl ProtoEvent {
@@ -957,6 +1036,12 @@ impl ProtoEvent {
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::KeyboardLayout(_) => EventType::KeyboardLayout,
+            ProtoEvent::MonitorGridCapabilities { .. } => EventType::MonitorGridCapabilities,
+            ProtoEvent::MonitorCatalogRequest => EventType::MonitorCatalogRequest,
+            ProtoEvent::MonitorCatalogChunk { .. } => EventType::MonitorCatalogChunk,
+            ProtoEvent::GridSnapshotChunk { .. } => EventType::GridSnapshotChunk,
+            ProtoEvent::GridSnapshotAck { .. } => EventType::GridSnapshotAck,
+            ProtoEvent::EnterMonitor { .. } => EventType::EnterMonitor,
         }
     }
 }
@@ -1029,51 +1114,129 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 };
                 Ok(Self::KeyboardLayout(layout))
             }
+            EventType::MonitorGridCapabilities => {
+                let version = decode_u8(&mut buf)?;
+                if version == 0 {
+                    return Err(ProtocolError::InvalidMonitorGridEvent);
+                }
+                Ok(Self::MonitorGridCapabilities { version })
+            }
+            EventType::MonitorCatalogRequest => Ok(Self::MonitorCatalogRequest),
+            EventType::MonitorCatalogChunk => {
+                let transfer_id = decode_u32(&mut buf)?;
+                let index = decode_u16(&mut buf)?;
+                let count = decode_u16(&mut buf)?;
+                validate_chunk(index, count)?;
+                let descriptor_count = decode_u8(&mut buf)? as usize;
+                if descriptor_count > MAX_MONITOR_CATALOG_CHUNK_ITEMS {
+                    return Err(ProtocolError::InvalidMonitorGridEvent);
+                }
+                let mut descriptors = Vec::with_capacity(descriptor_count);
+                for _ in 0..descriptor_count {
+                    let id = decode_monitor_id(&mut buf)?;
+                    let label = decode_bounded_string(&mut buf, MAX_MONITOR_LABEL_BYTES, true)?;
+                    let width = decode_u32(&mut buf)?;
+                    let height = decode_u32(&mut buf)?;
+                    descriptors.push(
+                        MonitorDescriptor::new(id, label, width, height)
+                            .map_err(|_| ProtocolError::InvalidMonitorGridEvent)?,
+                    );
+                }
+                Ok(Self::MonitorCatalogChunk {
+                    transfer_id,
+                    index,
+                    count,
+                    descriptors,
+                })
+            }
+            EventType::GridSnapshotChunk => {
+                let revision = decode_u64(&mut buf)?;
+                let origin_fingerprint =
+                    decode_bounded_string(&mut buf, MAX_MONITOR_ID_BYTES, false)?;
+                let index = decode_u16(&mut buf)?;
+                let count = decode_u16(&mut buf)?;
+                validate_chunk(index, count)?;
+                let payload_len = decode_u16(&mut buf)? as usize;
+                if payload_len == 0 || payload_len > MAX_MONITOR_GRID_CHUNK_PAYLOAD {
+                    return Err(ProtocolError::InvalidMonitorGridEvent);
+                }
+                let payload = decode_bytes(&mut buf, payload_len)?.to_vec();
+                Ok(Self::GridSnapshotChunk {
+                    revision,
+                    origin_fingerprint,
+                    index,
+                    count,
+                    payload,
+                })
+            }
+            EventType::GridSnapshotAck => {
+                let revision = decode_u64(&mut buf)?;
+                let origin_fingerprint =
+                    decode_bounded_string(&mut buf, MAX_MONITOR_ID_BYTES, false)?;
+                Ok(Self::GridSnapshotAck {
+                    revision,
+                    origin_fingerprint,
+                })
+            }
+            EventType::EnterMonitor => {
+                let monitor_id = decode_monitor_id(&mut buf)?;
+                let edge = decode_u8(&mut buf)?.try_into()?;
+                Ok(Self::EnterMonitor { monitor_id, edge })
+            }
         }
     }
 }
 
 impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
     fn from(event: ProtoEvent) -> Self {
+        event
+            .encode()
+            .expect("ProtoEvent must contain bounded monitor-grid data")
+    }
+}
+
+impl ProtoEvent {
+    /// Encode an event as one bounded DTLS application datagram.
+    pub fn encode(&self) -> Result<([u8; MAX_EVENT_SIZE], usize), ProtocolError> {
         let mut buf = [0u8; MAX_EVENT_SIZE];
         let mut len = 0usize;
         {
             let mut buf = &mut buf[..];
             let buf = &mut buf;
             let len = &mut len;
-            encode_u8(buf, len, event.event_type() as u8);
-            match event {
+            encode_u8(buf, len, self.event_type() as u8);
+            match self {
                 ProtoEvent::Input(event) => match event {
                     InputEvent::Pointer(p) => match p {
                         PointerEvent::Motion { time, dx, dy } => {
-                            encode_u32(buf, len, time);
-                            encode_f64(buf, len, dx);
-                            encode_f64(buf, len, dy);
+                            encode_u32(buf, len, *time);
+                            encode_f64(buf, len, *dx);
+                            encode_f64(buf, len, *dy);
                         }
                         PointerEvent::Button {
                             time,
                             button,
                             state,
                         } => {
-                            encode_u32(buf, len, time);
-                            encode_u32(buf, len, button);
-                            encode_u32(buf, len, state);
+                            encode_u32(buf, len, *time);
+                            encode_u32(buf, len, *button);
+                            encode_u32(buf, len, *state);
                         }
                         PointerEvent::Axis { time, axis, value } => {
-                            encode_u32(buf, len, time);
-                            encode_u8(buf, len, axis);
-                            encode_f64(buf, len, value);
+                            encode_u32(buf, len, *time);
+                            encode_u8(buf, len, *axis);
+                            encode_f64(buf, len, *value);
                         }
                         PointerEvent::AxisDiscrete120 { axis, value } => {
-                            encode_u8(buf, len, axis);
-                            encode_i32(buf, len, value);
+                            encode_u8(buf, len, *axis);
+                            encode_i32(buf, len, *value);
                         }
                     },
                     InputEvent::Keyboard(k) => match k {
                         KeyboardEvent::Key { time, key, state } => {
-                            encode_u32(buf, len, time);
-                            encode_u32(buf, len, key);
-                            encode_u8(buf, len, state);
+                            encode_u32(buf, len, *time);
+                            encode_u32(buf, len, *key);
+                            encode_u8(buf, len, *state);
                         }
                         KeyboardEvent::Modifiers {
                             depressed,
@@ -1081,18 +1244,18 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                             locked,
                             group,
                         } => {
-                            encode_u32(buf, len, depressed);
-                            encode_u32(buf, len, latched);
-                            encode_u32(buf, len, locked);
-                            encode_u32(buf, len, group);
+                            encode_u32(buf, len, *depressed);
+                            encode_u32(buf, len, *latched);
+                            encode_u32(buf, len, *locked);
+                            encode_u32(buf, len, *group);
                         }
                     },
                 },
                 ProtoEvent::Ping => {}
-                ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
-                ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
-                ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
-                ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
+                ProtoEvent::Pong(alive) => encode_u8(buf, len, *alive as u8),
+                ProtoEvent::Enter(pos) => encode_u8(buf, len, *pos as u8),
+                ProtoEvent::Leave(serial) => encode_u32(buf, len, *serial),
+                ProtoEvent::Ack(serial) => encode_u32(buf, len, *serial),
                 ProtoEvent::Hello { commit } => {
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
@@ -1101,9 +1264,112 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::KeyboardLayout(layout) => {
                     encode_u8(buf, len, layout.map_or(0, |layout| layout as u8));
                 }
+                ProtoEvent::MonitorGridCapabilities { version } => {
+                    if *version == 0 {
+                        return Err(ProtocolError::InvalidMonitorGridEvent);
+                    }
+                    encode_u8(buf, len, *version);
+                }
+                ProtoEvent::MonitorCatalogRequest => {}
+                ProtoEvent::MonitorCatalogChunk {
+                    transfer_id,
+                    index,
+                    count,
+                    descriptors,
+                } => {
+                    validate_chunk(*index, *count)?;
+                    if descriptors.len() > MAX_MONITOR_CATALOG_CHUNK_ITEMS {
+                        return Err(ProtocolError::InvalidMonitorGridEvent);
+                    }
+                    encode_u32(buf, len, *transfer_id);
+                    encode_u16(buf, len, *index);
+                    encode_u16(buf, len, *count);
+                    encode_u8(buf, len, descriptors.len() as u8);
+                    let mut seen = HashSet::with_capacity(descriptors.len());
+                    for descriptor in descriptors {
+                        descriptor
+                            .validate()
+                            .map_err(|_| ProtocolError::InvalidMonitorGridEvent)?;
+                        if !seen.insert(descriptor.id.as_str()) {
+                            return Err(ProtocolError::InvalidMonitorGridEvent);
+                        }
+                        encode_monitor_id(buf, len, &descriptor.id)?;
+                        encode_bounded_string(
+                            buf,
+                            len,
+                            &descriptor.label,
+                            MAX_MONITOR_LABEL_BYTES,
+                            true,
+                        )?;
+                        encode_u32(buf, len, descriptor.width);
+                        encode_u32(buf, len, descriptor.height);
+                    }
+                }
+                ProtoEvent::GridSnapshotChunk {
+                    revision,
+                    origin_fingerprint,
+                    index,
+                    count,
+                    payload,
+                } => {
+                    validate_chunk(*index, *count)?;
+                    validate_fingerprint(origin_fingerprint)?;
+                    if payload.is_empty() || payload.len() > MAX_MONITOR_GRID_CHUNK_PAYLOAD {
+                        return Err(ProtocolError::InvalidMonitorGridEvent);
+                    }
+                    encode_u64(buf, len, *revision);
+                    encode_bounded_string(
+                        buf,
+                        len,
+                        origin_fingerprint,
+                        MAX_MONITOR_ID_BYTES,
+                        false,
+                    )?;
+                    encode_u16(buf, len, *index);
+                    encode_u16(buf, len, *count);
+                    encode_u16(buf, len, payload.len() as u16);
+                    encode_payload(buf, len, payload)?;
+                }
+                ProtoEvent::GridSnapshotAck {
+                    revision,
+                    origin_fingerprint,
+                } => {
+                    validate_fingerprint(origin_fingerprint)?;
+                    encode_u64(buf, len, *revision);
+                    encode_bounded_string(
+                        buf,
+                        len,
+                        origin_fingerprint,
+                        MAX_MONITOR_ID_BYTES,
+                        false,
+                    )?;
+                }
+                ProtoEvent::EnterMonitor { monitor_id, edge } => {
+                    encode_monitor_id(buf, len, monitor_id)?;
+                    encode_u8(buf, len, *edge as u8);
+                }
             }
         }
-        (buf, len)
+        if len > MAX_CLIPBOARD_FRAME_SIZE {
+            return Err(ProtocolError::InvalidMonitorGridEvent);
+        }
+        Ok((buf, len))
+    }
+
+    /// Decode one complete event datagram, rejecting truncation and trailing
+    /// bytes before the event can reach routing code.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_FRAME_SIZE {
+            return Err(ProtocolError::InvalidMonitorGridEvent);
+        }
+        let mut padded = [0; MAX_EVENT_SIZE];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        let event = Self::try_from(padded)?;
+        let (_, encoded_len) = event.encode()?;
+        if encoded_len != bytes.len() {
+            return Err(ProtocolError::InvalidMonitorGridEvent);
+        }
+        Ok(event)
     }
 }
 
@@ -1120,7 +1386,9 @@ macro_rules! decode_impl {
 }
 
 decode_impl!(u8);
+decode_impl!(u16);
 decode_impl!(u32);
+decode_impl!(u64);
 decode_impl!(i32);
 decode_impl!(f64);
 
@@ -1140,9 +1408,95 @@ macro_rules! encode_impl {
 }
 
 encode_impl!(u8);
+encode_impl!(u16);
 encode_impl!(u32);
+encode_impl!(u64);
 encode_impl!(i32);
 encode_impl!(f64);
+
+fn decode_bytes<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], ProtocolError> {
+    if len > data.len() {
+        return Err(ProtocolError::InvalidMonitorGridEvent);
+    }
+    let (bytes, rest) = data.split_at(len);
+    *data = rest;
+    Ok(bytes)
+}
+
+fn decode_bounded_string(
+    data: &mut &[u8],
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<String, ProtocolError> {
+    let len = decode_u8(data)? as usize;
+    if len > max_bytes || (!allow_empty && len == 0) {
+        return Err(ProtocolError::InvalidMonitorGridEvent);
+    }
+    let bytes = decode_bytes(data, len)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| ProtocolError::InvalidMonitorGridEvent)
+}
+
+fn decode_monitor_id(data: &mut &[u8]) -> Result<MonitorId, ProtocolError> {
+    let value = decode_bounded_string(data, MAX_MONITOR_ID_BYTES, false)?;
+    MonitorId::new(value).map_err(|_| ProtocolError::InvalidMonitorGridEvent)
+}
+
+fn validate_chunk(index: u16, count: u16) -> Result<(), ProtocolError> {
+    if count == 0 || index >= count || count > 256 {
+        Err(ProtocolError::InvalidMonitorGridEvent)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_fingerprint(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty() || value.len() > MAX_MONITOR_ID_BYTES {
+        Err(ProtocolError::InvalidMonitorGridEvent)
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_bounded_string(
+    buf: &mut &mut [u8],
+    amt: &mut usize,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), ProtocolError> {
+    if value.len() > max_bytes
+        || value.len() > u8::MAX as usize
+        || (!allow_empty && value.is_empty())
+    {
+        return Err(ProtocolError::InvalidMonitorGridEvent);
+    }
+    encode_u8(buf, amt, value.len() as u8);
+    encode_payload(buf, amt, value.as_bytes())
+}
+
+fn encode_monitor_id(
+    buf: &mut &mut [u8],
+    amt: &mut usize,
+    monitor_id: &MonitorId,
+) -> Result<(), ProtocolError> {
+    encode_bounded_string(buf, amt, monitor_id.as_str(), MAX_MONITOR_ID_BYTES, false)
+}
+
+fn encode_payload(
+    buf: &mut &mut [u8],
+    amt: &mut usize,
+    payload: &[u8],
+) -> Result<(), ProtocolError> {
+    if payload.len() > buf.len() {
+        return Err(ProtocolError::InvalidMonitorGridEvent);
+    }
+    let current = std::mem::take(buf);
+    let (encoded, rest) = current.split_at_mut(payload.len());
+    encoded.copy_from_slice(payload);
+    *amt += payload.len();
+    *buf = rest;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1237,5 +1591,234 @@ mod tests {
         trailing.push(0);
         assert!(FileOfferAnnouncement::decode(&trailing).is_err());
         assert!(FileOfferAnnouncement::decode(b"LMF1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod monitor_grid_protocol_tests {
+    use super::*;
+    use input_event::{MonitorDescriptor, MonitorId};
+
+    fn monitor_id(value: &str) -> MonitorId {
+        MonitorId::new(value.to_owned()).unwrap()
+    }
+
+    fn encode(event: ProtoEvent) -> (Vec<u8>, usize) {
+        let (buffer, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        (buffer[..len].to_vec(), len)
+    }
+
+    #[test]
+    fn monitor_grid_protocol_events_round_trip() {
+        let capability = ProtoEvent::MonitorGridCapabilities { version: 1 };
+        let (bytes, _) = encode(capability);
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::MonitorGridCapabilities { version: 1 })
+        ));
+
+        let (bytes, _) = encode(ProtoEvent::MonitorCatalogRequest);
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::MonitorCatalogRequest)
+        ));
+
+        let descriptor = MonitorDescriptor {
+            id: monitor_id("DP-1"),
+            label: "LG UltraFine".into(),
+            width: 3840,
+            height: 2160,
+        };
+        let (bytes, _) = encode(ProtoEvent::MonitorCatalogChunk {
+            transfer_id: 42,
+            index: 1,
+            count: 3,
+            descriptors: vec![descriptor],
+        });
+        match ProtoEvent::decode(&bytes).unwrap() {
+            ProtoEvent::MonitorCatalogChunk {
+                transfer_id,
+                index,
+                count,
+                descriptors,
+            } => {
+                assert_eq!((transfer_id, index, count), (42, 1, 3));
+                assert_eq!(descriptors.len(), 1);
+                assert_eq!(descriptors[0].id.as_str(), "DP-1");
+                assert_eq!(descriptors[0].label, "LG UltraFine");
+                assert_eq!((descriptors[0].width, descriptors[0].height), (3840, 2160));
+            }
+            other => panic!("expected catalog chunk, got {other:?}"),
+        }
+
+        let (bytes, _) = encode(ProtoEvent::GridSnapshotChunk {
+            revision: 77,
+            origin_fingerprint: "ab12cd".into(),
+            index: 2,
+            count: 5,
+            payload: vec![1, 2, 3, 4],
+        });
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::GridSnapshotChunk {
+                revision: 77,
+                index: 2,
+                count: 5,
+                ..
+            })
+        ));
+
+        let (bytes, _) = encode(ProtoEvent::GridSnapshotAck {
+            revision: 77,
+            origin_fingerprint: "ab12cd".into(),
+        });
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::GridSnapshotAck { revision: 77, .. })
+        ));
+
+        let (bytes, _) = encode(ProtoEvent::EnterMonitor {
+            monitor_id: monitor_id("\\\\.\\DISPLAY2"),
+            edge: Position::Top,
+        });
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::EnterMonitor {
+                edge: Position::Top,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn monitor_grid_chunks_preserve_ordering_metadata() {
+        let event = ProtoEvent::GridSnapshotChunk {
+            revision: 9,
+            origin_fingerprint: "fingerprint".into(),
+            index: 3,
+            count: 8,
+            payload: vec![7; 512],
+        };
+        let (bytes, len) = encode(event);
+        assert!(len <= MAX_CLIPBOARD_FRAME_SIZE);
+        match ProtoEvent::decode(&bytes).unwrap() {
+            ProtoEvent::GridSnapshotChunk {
+                revision,
+                origin_fingerprint,
+                index,
+                count,
+                payload,
+            } => {
+                assert_eq!(revision, 9);
+                assert_eq!(origin_fingerprint, "fingerprint");
+                assert_eq!(index, 3);
+                assert_eq!(count, 8);
+                assert_eq!(payload, vec![7; 512]);
+            }
+            other => panic!("expected snapshot chunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_monitor_grid_event_lengths_are_rejected() {
+        let (bytes, len) = encode(ProtoEvent::GridSnapshotChunk {
+            revision: 1,
+            origin_fingerprint: "origin".into(),
+            index: 0,
+            count: 1,
+            payload: vec![1, 2, 3],
+        });
+        assert!(ProtoEvent::decode(&bytes[..len - 1]).is_err());
+        assert!(ProtoEvent::decode(&[13]).is_err());
+    }
+
+    #[test]
+    fn monitor_grid_events_reject_invalid_chunk_metadata_and_oversized_datagrams() {
+        assert!(ProtoEvent::decode(&[15, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+
+        let too_large = ProtoEvent::GridSnapshotChunk {
+            revision: 1,
+            origin_fingerprint: "origin".into(),
+            index: 0,
+            count: 1,
+            payload: vec![0; MAX_CLIPBOARD_FRAME_SIZE],
+        };
+        let result = too_large.encode();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn legacy_enter_event_round_trips_unchanged() {
+        let (bytes, _) = encode(ProtoEvent::Enter(Position::Right));
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::Enter(Position::Right))
+        ));
+    }
+
+    #[test]
+    fn every_legacy_event_round_trips_with_its_original_discriminant() {
+        let legacy_events = [
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 7,
+                dx: 1.25,
+                dy: -4.5,
+            })),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button {
+                time: 8,
+                button: 272,
+                state: 1,
+            })),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Axis {
+                time: 9,
+                axis: 1,
+                value: 3.5,
+            })),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: -120,
+            })),
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Key {
+                time: 10,
+                key: 30,
+                state: 1,
+            })),
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 1,
+                latched: 2,
+                locked: 4,
+                group: 0,
+            })),
+            ProtoEvent::Ping,
+            ProtoEvent::Pong(true),
+            ProtoEvent::Enter(Position::Bottom),
+            ProtoEvent::Leave(11),
+            ProtoEvent::Ack(12),
+            ProtoEvent::Hello {
+                commit: *b"12345678",
+            },
+            ProtoEvent::KeyboardLayout(Some(KeyboardLayout::PortugueseBrazil)),
+        ];
+
+        for (expected_id, event) in legacy_events.iter().enumerate() {
+            let (buffer, len) = event.encode().unwrap();
+            assert!(len <= MAX_EVENT_SIZE);
+            assert_eq!(buffer[0], expected_id as u8);
+            assert_eq!(ProtoEvent::decode(&buffer[..len]).unwrap(), *event);
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_and_out_of_range_monitor_ids() {
+        let (bytes, len) = encode(ProtoEvent::MonitorGridCapabilities { version: 1 });
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(trailing.len(), len + 1);
+        assert!(ProtoEvent::decode(&trailing).is_err());
+
+        let mut oversized_id = vec![EventType::EnterMonitor as u8, 97];
+        oversized_id.extend(std::iter::repeat_n(b'x', 97));
+        oversized_id.push(Position::Left as u8);
+        assert!(ProtoEvent::decode(&oversized_id).is_err());
     }
 }
