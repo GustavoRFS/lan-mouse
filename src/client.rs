@@ -311,9 +311,13 @@ impl ClientManager {
         }
     }
 
-    pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) {
+    pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) -> bool {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            let changed = s.alive != alive;
             s.alive = alive;
+            changed
+        } else {
+            false
         }
     }
 
@@ -369,5 +373,21 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alive_status_changes_only_when_the_value_changes() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+
+        assert!(clients.set_alive(handle, true));
+        assert!(!clients.set_alive(handle, true));
+        assert!(clients.set_alive(handle, false));
+        assert!(!clients.set_alive(handle, false));
     }
 }

@@ -35,7 +35,7 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 use xkbcommon::xkb;
 
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
+    Connection, Dispatch, DispatchError, EventQueue, QueueHandle, delegate_noop,
     globals::{Global, GlobalList, GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
@@ -150,9 +150,10 @@ impl WlrootsEmulation {
             emulate.state.register_global(global);
         }
         emulate.queue.flush()?;
-        while emulate.state.keymap.is_none() && emulate.state.configured_keymap.is_none() {
-            emulate.queue.blocking_dispatch(&mut emulate.state)?;
-        }
+        initialize_wayland_queue(&mut QueueStartup {
+            queue: &mut emulate.queue,
+            state: &mut emulate.state,
+        })?;
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
         // log::debug!("{:?}", &mmap[..100]);
@@ -260,6 +261,10 @@ impl State {
 
 #[async_trait]
 impl Emulation for WlrootsEmulation {
+    fn supports_monitor_grid(&self) -> bool {
+        true
+    }
+
     async fn consume(
         &mut self,
         event: Event,
@@ -326,6 +331,7 @@ impl Emulation for WlrootsEmulation {
         monitor_id: &MonitorId,
         edge: Position,
     ) -> Result<(), EmulationError> {
+        self.queue.roundtrip(&mut self.state)?;
         let geometries = self.state.monitor_geometries();
         let target = resolve_entry_midpoint(&geometries, monitor_id, edge)
             .map_err(|error| EmulationError::MonitorEntry(error.to_string()))?;
@@ -400,6 +406,48 @@ impl Emulation for WlrootsEmulation {
         }
         self.state.fixed_keymap = fixed_keymap;
         Ok(())
+    }
+}
+
+trait StartupDispatcher {
+    type Error;
+
+    fn roundtrip(&mut self) -> Result<(), Self::Error>;
+    fn has_keymap(&self) -> bool;
+    fn has_configured_keymap(&self) -> bool;
+    fn dispatch_until_keymap(&mut self) -> Result<(), Self::Error>;
+}
+
+fn initialize_wayland_queue<D: StartupDispatcher>(dispatcher: &mut D) -> Result<(), D::Error> {
+    dispatcher.roundtrip()?;
+    while !dispatcher.has_keymap() && !dispatcher.has_configured_keymap() {
+        dispatcher.dispatch_until_keymap()?;
+    }
+    Ok(())
+}
+
+struct QueueStartup<'a> {
+    queue: &'a mut EventQueue<State>,
+    state: &'a mut State,
+}
+
+impl StartupDispatcher for QueueStartup<'_> {
+    type Error = DispatchError;
+
+    fn roundtrip(&mut self) -> Result<(), Self::Error> {
+        self.queue.roundtrip(self.state).map(|_| ())
+    }
+
+    fn has_keymap(&self) -> bool {
+        self.state.keymap.is_some()
+    }
+
+    fn has_configured_keymap(&self) -> bool {
+        self.state.configured_keymap.is_some()
+    }
+
+    fn dispatch_until_keymap(&mut self) -> Result<(), Self::Error> {
+        self.queue.blocking_dispatch(self.state).map(|_| ())
     }
 }
 
@@ -714,6 +762,36 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
 
+    struct FakeStartup {
+        configured_keymap: bool,
+        has_keymap: bool,
+        roundtrips: usize,
+        keymap_dispatches: usize,
+    }
+
+    impl StartupDispatcher for FakeStartup {
+        type Error = ();
+
+        fn roundtrip(&mut self) -> Result<(), Self::Error> {
+            self.roundtrips += 1;
+            Ok(())
+        }
+
+        fn has_keymap(&self) -> bool {
+            self.has_keymap
+        }
+
+        fn has_configured_keymap(&self) -> bool {
+            self.configured_keymap
+        }
+
+        fn dispatch_until_keymap(&mut self) -> Result<(), Self::Error> {
+            self.keymap_dispatches += 1;
+            self.has_keymap = true;
+            Ok(())
+        }
+    }
+
     /// evdev's KEY_SEMICOLON, the key right of L, plus the offset xkb adds to evdev codes
     const KEY_RIGHT_OF_L: u32 = 39 + 8;
 
@@ -773,5 +851,18 @@ mod tests {
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).unwrap();
         assert_eq!(contents, b"xkb_keymap {}\0");
+    }
+
+    #[test]
+    fn configured_layout_still_dispatches_initial_output_events() {
+        let mut startup = FakeStartup {
+            configured_keymap: true,
+            has_keymap: false,
+            roundtrips: 0,
+            keymap_dispatches: 0,
+        };
+        initialize_wayland_queue(&mut startup).unwrap();
+        assert_eq!(startup.roundtrips, 1);
+        assert_eq!(startup.keymap_dispatches, 0);
     }
 }

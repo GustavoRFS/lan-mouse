@@ -647,6 +647,10 @@ impl Capture for LayerShellInputCapture {
     fn monitor_catalog(&self) -> Vec<MonitorDescriptor> {
         LayerShellInputCapture::monitor_catalog(self)
     }
+
+    fn supports_monitor_grid(&self) -> bool {
+        true
+    }
 }
 
 impl Stream for LayerShellInputCapture {

@@ -178,6 +178,11 @@ impl InputEmulation {
         self.emulation.enter_monitor(handle, monitor_id, edge).await
     }
 
+    /// Whether the selected backend can position its pointer on a named output edge.
+    pub fn supports_monitor_grid(&self) -> bool {
+        self.emulation.supports_monitor_grid()
+    }
+
     pub async fn consume(
         &mut self,
         event: Event,
@@ -281,6 +286,9 @@ trait Emulation: Send {
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
     fn select_handle(&mut self, _handle: EmulationHandle) {}
+    fn supports_monitor_grid(&self) -> bool {
+        false
+    }
     async fn enter_monitor(
         &mut self,
         _handle: EmulationHandle,

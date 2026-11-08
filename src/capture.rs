@@ -52,10 +52,13 @@ pub(crate) enum ICaptureEvent {
         update_id: ClipboardUpdateId,
         payload: ClipboardPayload,
     },
-    LocalMonitorCatalog(Vec<MonitorDescriptor>),
+    LocalMonitorCatalog {
+        monitors: Vec<MonitorDescriptor>,
+        supports_monitor_grid: bool,
+    },
     PeerConnected(CaptureHandle),
     PeerDisconnected(CaptureHandle),
-    PeerStatus(CaptureHandle),
+    PeerStatus(CaptureHandle, bool),
     PeerProtocol {
         handle: CaptureHandle,
         event: ProtoEvent,
@@ -247,6 +250,18 @@ impl Capture {
     }
 }
 
+fn is_monitor_grid_protocol_event(event: &ProtoEvent) -> bool {
+    matches!(
+        event,
+        ProtoEvent::MonitorGridCapabilities { .. }
+            | ProtoEvent::MonitorCatalogRequest
+            | ProtoEvent::MonitorCatalogChunk { .. }
+            | ProtoEvent::MonitorCatalogAck { .. }
+            | ProtoEvent::GridSnapshotChunk { .. }
+            | ProtoEvent::GridSnapshotAck { .. }
+    )
+}
+
 /// debounce a statement `$st`, i.e. the statement is executed only if the
 /// time since the previous execution is at least `$dur`.
 /// `$prev` is used to keep track of this timestamp
@@ -355,8 +370,8 @@ impl CaptureTask {
                             NetworkEvent::Disconnected => {
                                 self.event_tx.send(ICaptureEvent::PeerDisconnected(handle)).expect("channel closed");
                             }
-                            NetworkEvent::PeerStatus => {
-                                self.event_tx.send(ICaptureEvent::PeerStatus(handle)).expect("channel closed");
+                            NetworkEvent::PeerStatus { changed } => {
+                                self.event_tx.send(ICaptureEvent::PeerStatus(handle, changed)).expect("channel closed");
                             }
                             NetworkEvent::Proto(event) => {
                                 self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed");
@@ -377,9 +392,10 @@ impl CaptureTask {
         };
 
         self.event_tx
-            .send(ICaptureEvent::LocalMonitorCatalog(
-                capture.monitor_catalog(),
-            ))
+            .send(ICaptureEvent::LocalMonitorCatalog {
+                monitors: capture.monitor_catalog(),
+                supports_monitor_grid: capture.supports_monitor_grid(),
+            })
             .expect("channel closed");
 
         let _capture_guard = DropGuard::new(
@@ -427,7 +443,10 @@ impl CaptureTask {
                     let catalog = capture.monitor_catalog();
                     if catalog != last_monitor_catalog {
                         last_monitor_catalog = catalog.clone();
-                        self.event_tx.send(ICaptureEvent::LocalMonitorCatalog(catalog)).expect("channel closed");
+                        self.event_tx.send(ICaptureEvent::LocalMonitorCatalog {
+                            monitors: catalog,
+                            supports_monitor_grid: capture.supports_monitor_grid(),
+                        }).expect("channel closed");
                     }
                 },
                 event = capture.next() => match event {
@@ -448,8 +467,14 @@ impl CaptureTask {
                             self.event_tx.send(ICaptureEvent::PeerDisconnected(handle)).expect("channel closed");
                             continue;
                         }
-                        NetworkEvent::PeerStatus => {
-                            self.event_tx.send(ICaptureEvent::PeerStatus(handle)).expect("channel closed");
+                        NetworkEvent::PeerStatus { changed } => {
+                            self.event_tx.send(ICaptureEvent::PeerStatus(handle, changed)).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::Proto(event)
+                            if is_monitor_grid_protocol_event(&event) =>
+                        {
+                            self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed");
                             continue;
                         }
                         NetworkEvent::Proto(event) => event,

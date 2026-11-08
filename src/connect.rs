@@ -61,7 +61,9 @@ struct ClientConnection {
 pub(crate) enum NetworkEvent {
     Connected,
     Disconnected,
-    PeerStatus,
+    PeerStatus {
+        changed: bool,
+    },
     Proto(ProtoEvent),
     Clipboard {
         update_id: ClipboardUpdateId,
@@ -304,13 +306,9 @@ async fn connect_to_handle(
         // mirrors a Hello back so the receive loop can populate
         // `peer_commit`. Old peers will silently skip this event
         // per the forward-compat handler in [`receive_loop`].
-        for event in [
-            ProtoEvent::Hello {
-                commit: local_commit(),
-            },
-            ProtoEvent::MonitorGridCapabilities { version: 1 },
-            ProtoEvent::MonitorCatalogRequest,
-        ] {
+        for event in [ProtoEvent::Hello {
+            commit: local_commit(),
+        }] {
             match event.encode() {
                 Ok((buf, len)) => {
                     if let Err(error) = conn.send(&buf[..len]).await {
@@ -405,18 +403,13 @@ async fn receive_loop(
                 match event {
                     ProtoEvent::Pong(b) => {
                         client_manager.set_active_addr(handle, Some(addr));
-                        client_manager.set_alive(handle, b);
+                        let changed = client_manager.set_alive(handle, b);
                         ping_response.borrow_mut().insert(addr);
-                        tx.send((handle, NetworkEvent::PeerStatus))
+                        tx.send((handle, NetworkEvent::PeerStatus { changed }))
                             .expect("channel closed");
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
-                    }
-                    ProtoEvent::MonitorGridCapabilities { version } => {
-                        client_manager.set_monitor_grid_version(handle, Some(version));
-                        tx.send((handle, NetworkEvent::Proto(event)))
-                            .expect("channel closed");
                     }
                     event => tx
                         .send((handle, NetworkEvent::Proto(event)))

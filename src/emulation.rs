@@ -28,6 +28,7 @@ pub(crate) struct Emulation {
 }
 
 pub(crate) enum EmulationEvent {
+    MonitorGridSupport(bool),
     Connected {
         addr: SocketAddr,
         fingerprint: String,
@@ -249,7 +250,6 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             ProtoEvent::MonitorGridCapabilities { version } => {
-                                self.listener.reply(addr, ProtoEvent::MonitorGridCapabilities { version: 1 }).await;
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     self.event_tx.send(EmulationEvent::PeerProtocol {
                                         addr,
@@ -260,6 +260,7 @@ impl ListenTask {
                             }
                             event @ ProtoEvent::MonitorCatalogRequest
                             | event @ ProtoEvent::MonitorCatalogChunk { .. }
+                            | event @ ProtoEvent::MonitorCatalogAck { .. }
                             | event @ ProtoEvent::GridSnapshotChunk { .. }
                             | event @ ProtoEvent::GridSnapshotAck { .. } => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
@@ -555,6 +556,12 @@ impl EmulationTask {
                 }
             }
         };
+
+        self.event_tx
+            .send(EmulationEvent::MonitorGridSupport(
+                emulation.supports_monitor_grid(),
+            ))
+            .expect("channel closed");
 
         if let Some((_, layout)) = self.keyboard_layout_source {
             if let Err(error) = self.apply_keyboard_layout(&mut emulation, layout).await {

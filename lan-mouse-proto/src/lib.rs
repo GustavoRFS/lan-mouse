@@ -901,11 +901,14 @@ pub enum ProtoEvent {
     MonitorCatalogRequest,
     /// A bounded part of an active display catalog.
     MonitorCatalogChunk {
+        revision: u64,
         transfer_id: u32,
         index: u16,
         count: u16,
         descriptors: Vec<MonitorDescriptor>,
     },
+    /// Acknowledge receipt of a complete or superseded display catalog.
+    MonitorCatalogAck { revision: u64, transfer_id: u32 },
     /// A bounded part of a serialized, versioned monitor-grid snapshot.
     GridSnapshotChunk {
         revision: u64,
@@ -956,15 +959,20 @@ impl Display for ProtoEvent {
             }
             ProtoEvent::MonitorCatalogRequest => write!(f, "MonitorCatalogRequest"),
             ProtoEvent::MonitorCatalogChunk {
+                revision,
                 transfer_id,
                 index,
                 count,
                 descriptors,
             } => write!(
                 f,
-                "MonitorCatalogChunk({transfer_id}, {index}/{count}, {} displays)",
+                "MonitorCatalogChunk(revision {revision}, {transfer_id}, {index}/{count}, {} displays)",
                 descriptors.len()
             ),
+            ProtoEvent::MonitorCatalogAck {
+                revision,
+                transfer_id,
+            } => write!(f, "MonitorCatalogAck(revision {revision}, {transfer_id})"),
             ProtoEvent::GridSnapshotChunk {
                 revision,
                 index,
@@ -1012,6 +1020,7 @@ pub enum EventType {
     GridSnapshotChunk = 16,
     GridSnapshotAck = 17,
     EnterMonitor = 18,
+    MonitorCatalogAck = 19,
 }
 
 impl ProtoEvent {
@@ -1039,6 +1048,7 @@ impl ProtoEvent {
             ProtoEvent::MonitorGridCapabilities { .. } => EventType::MonitorGridCapabilities,
             ProtoEvent::MonitorCatalogRequest => EventType::MonitorCatalogRequest,
             ProtoEvent::MonitorCatalogChunk { .. } => EventType::MonitorCatalogChunk,
+            ProtoEvent::MonitorCatalogAck { .. } => EventType::MonitorCatalogAck,
             ProtoEvent::GridSnapshotChunk { .. } => EventType::GridSnapshotChunk,
             ProtoEvent::GridSnapshotAck { .. } => EventType::GridSnapshotAck,
             ProtoEvent::EnterMonitor { .. } => EventType::EnterMonitor,
@@ -1116,13 +1126,11 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             }
             EventType::MonitorGridCapabilities => {
                 let version = decode_u8(&mut buf)?;
-                if version == 0 {
-                    return Err(ProtocolError::InvalidMonitorGridEvent);
-                }
                 Ok(Self::MonitorGridCapabilities { version })
             }
             EventType::MonitorCatalogRequest => Ok(Self::MonitorCatalogRequest),
             EventType::MonitorCatalogChunk => {
+                let revision = decode_u64(&mut buf)?;
                 let transfer_id = decode_u32(&mut buf)?;
                 let index = decode_u16(&mut buf)?;
                 let count = decode_u16(&mut buf)?;
@@ -1143,12 +1151,17 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                     );
                 }
                 Ok(Self::MonitorCatalogChunk {
+                    revision,
                     transfer_id,
                     index,
                     count,
                     descriptors,
                 })
             }
+            EventType::MonitorCatalogAck => Ok(Self::MonitorCatalogAck {
+                revision: decode_u64(&mut buf)?,
+                transfer_id: decode_u32(&mut buf)?,
+            }),
             EventType::GridSnapshotChunk => {
                 let revision = decode_u64(&mut buf)?;
                 let origin_fingerprint =
@@ -1265,13 +1278,11 @@ impl ProtoEvent {
                     encode_u8(buf, len, layout.map_or(0, |layout| layout as u8));
                 }
                 ProtoEvent::MonitorGridCapabilities { version } => {
-                    if *version == 0 {
-                        return Err(ProtocolError::InvalidMonitorGridEvent);
-                    }
                     encode_u8(buf, len, *version);
                 }
                 ProtoEvent::MonitorCatalogRequest => {}
                 ProtoEvent::MonitorCatalogChunk {
+                    revision,
                     transfer_id,
                     index,
                     count,
@@ -1281,6 +1292,7 @@ impl ProtoEvent {
                     if descriptors.len() > MAX_MONITOR_CATALOG_CHUNK_ITEMS {
                         return Err(ProtocolError::InvalidMonitorGridEvent);
                     }
+                    encode_u64(buf, len, *revision);
                     encode_u32(buf, len, *transfer_id);
                     encode_u16(buf, len, *index);
                     encode_u16(buf, len, *count);
@@ -1304,6 +1316,13 @@ impl ProtoEvent {
                         encode_u32(buf, len, descriptor.width);
                         encode_u32(buf, len, descriptor.height);
                     }
+                }
+                ProtoEvent::MonitorCatalogAck {
+                    revision,
+                    transfer_id,
+                } => {
+                    encode_u64(buf, len, *revision);
+                    encode_u32(buf, len, *transfer_id);
                 }
                 ProtoEvent::GridSnapshotChunk {
                     revision,
@@ -1616,6 +1635,11 @@ mod monitor_grid_protocol_tests {
             ProtoEvent::decode(&bytes),
             Ok(ProtoEvent::MonitorGridCapabilities { version: 1 })
         ));
+        let (bytes, _) = encode(ProtoEvent::MonitorGridCapabilities { version: 0 });
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::MonitorGridCapabilities { version: 0 })
+        ));
 
         let (bytes, _) = encode(ProtoEvent::MonitorCatalogRequest);
         assert!(matches!(
@@ -1631,6 +1655,7 @@ mod monitor_grid_protocol_tests {
             native_position: None,
         };
         let (bytes, _) = encode(ProtoEvent::MonitorCatalogChunk {
+            revision: 12,
             transfer_id: 42,
             index: 1,
             count: 3,
@@ -1638,11 +1663,13 @@ mod monitor_grid_protocol_tests {
         });
         match ProtoEvent::decode(&bytes).unwrap() {
             ProtoEvent::MonitorCatalogChunk {
+                revision,
                 transfer_id,
                 index,
                 count,
                 descriptors,
             } => {
+                assert_eq!(revision, 12);
                 assert_eq!((transfer_id, index, count), (42, 1, 3));
                 assert_eq!(descriptors.len(), 1);
                 assert_eq!(descriptors[0].id.as_str(), "DP-1");
@@ -1651,6 +1678,18 @@ mod monitor_grid_protocol_tests {
             }
             other => panic!("expected catalog chunk, got {other:?}"),
         }
+
+        let (bytes, _) = encode(ProtoEvent::MonitorCatalogAck {
+            revision: 12,
+            transfer_id: 42,
+        });
+        assert!(matches!(
+            ProtoEvent::decode(&bytes),
+            Ok(ProtoEvent::MonitorCatalogAck {
+                revision: 12,
+                transfer_id: 42,
+            })
+        ));
 
         let (bytes, _) = encode(ProtoEvent::GridSnapshotChunk {
             revision: 77,

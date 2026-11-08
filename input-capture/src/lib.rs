@@ -261,6 +261,11 @@ impl InputCapture {
         self.capture.monitor_catalog()
     }
 
+    /// Whether this backend can capture named monitor edges.
+    pub fn supports_monitor_grid(&self) -> bool {
+        self.capture.supports_monitor_grid()
+    }
+
     /// check whether the given keys are pressed
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
         keys.iter().all(|k| self.pressed_keys.contains(k))
@@ -343,6 +348,10 @@ trait Capture: Stream<Item = Result<(CapturePoint, CaptureEvent), CaptureError>>
 
     fn monitor_catalog(&self) -> Vec<MonitorDescriptor> {
         Vec::new()
+    }
+
+    fn supports_monitor_grid(&self) -> bool {
+        false
     }
 
     /// release mouse

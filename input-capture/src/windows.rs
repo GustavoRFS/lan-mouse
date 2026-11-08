@@ -37,6 +37,10 @@ impl Capture for WindowsInputCapture {
             .collect()
     }
 
+    fn supports_monitor_grid(&self) -> bool {
+        true
+    }
+
     async fn release(&mut self) -> Result<(), CaptureError> {
         self.event_thread.release_capture()?;
         Ok(())

@@ -30,6 +30,9 @@ pub enum EmulationError {
     #[cfg(wlroots)]
     #[error("wayland error: `{0}`")]
     Wayland(#[from] wayland_client::backend::WaylandError),
+    #[cfg(wlroots)]
+    #[error("wayland dispatch error: `{0}`")]
+    Dispatch(#[from] wayland_client::DispatchError),
     #[cfg(any(rdp, libei))]
     #[error("xdg-desktop-portal: `{0}`")]
     Ashpd(#[from] ashpd::Error),

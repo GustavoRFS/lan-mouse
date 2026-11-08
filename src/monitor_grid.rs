@@ -43,11 +43,15 @@ mod tests {
     #[test]
     fn empty_remote_catalog_completes_discovery() {
         let mut reassembler = MonitorCatalogReassembler::default();
-        let chunks = catalog_chunks(8, &[]);
+        let chunks = catalog_chunks(1, 8, &[]);
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             reassembler.push(chunks[0].clone()).unwrap(),
-            Some(Vec::new())
+            Some(MonitorCatalogUpdate::Applied {
+                revision: 1,
+                transfer_id: 8,
+                monitors: Vec::new(),
+            })
         );
     }
 
@@ -156,6 +160,72 @@ mod tests {
         }
         assert_eq!(applied, Some(GridSnapshotUpdate::Applied(grid.clone())));
         assert!(sender.acknowledge(grid.revision, &grid.origin_fingerprint));
+        assert!(sender.pending_chunks().is_empty());
+    }
+
+    #[test]
+    fn persisted_or_locally_applied_grid_is_the_snapshot_revision_floor() {
+        let persisted =
+            MonitorGrid::new(100, "local".into(), vec![entry("local", "one", 0, 0)]).unwrap();
+        let stale =
+            MonitorGrid::new(99, "remote".into(), vec![entry("remote", "two", 0, 0)]).unwrap();
+        let mut receiver = GridSnapshotReassembler::default();
+        receiver.observe_applied(&persisted);
+        let sender = GridSnapshotSender::new(&stale).unwrap();
+
+        let updates = sender
+            .pending_chunks()
+            .into_iter()
+            .map(|chunk| receiver.push(chunk).unwrap())
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            updates,
+            vec![GridSnapshotUpdate::Stale {
+                revision: 99,
+                origin_fingerprint: "remote".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn monitor_catalogs_reject_older_transfers_and_retry_until_acknowledged() {
+        let old_catalog = vec![MonitorDescriptor::new(id("old"), "Old".into(), 800, 600).unwrap()];
+        let new_catalog =
+            vec![MonitorDescriptor::new(id("new"), "New".into(), 1920, 1080).unwrap()];
+        let mut sender = MonitorCatalogSender::new(11, 7, &old_catalog).unwrap();
+        let old_chunks = sender.pending_chunks();
+        let new_chunks = catalog_chunks(12, 8, &new_catalog);
+        let mut receiver = MonitorCatalogReassembler::default();
+
+        let applied = new_chunks
+            .into_iter()
+            .filter_map(|chunk| receiver.push(chunk).unwrap())
+            .last();
+        assert_eq!(
+            applied,
+            Some(MonitorCatalogUpdate::Applied {
+                revision: 12,
+                transfer_id: 8,
+                monitors: new_catalog,
+            })
+        );
+
+        let stale = old_chunks
+            .into_iter()
+            .filter_map(|chunk| receiver.push(chunk).unwrap())
+            .last();
+        assert_eq!(
+            stale,
+            Some(MonitorCatalogUpdate::Stale {
+                revision: 11,
+                transfer_id: 7,
+            })
+        );
+
+        assert_eq!(sender.retry_unacknowledged(), sender.pending_chunks());
+        assert!(sender.acknowledge(11, 7));
         assert!(sender.pending_chunks().is_empty());
     }
 }
@@ -270,9 +340,14 @@ pub fn enter_event(
     }
 }
 
-pub fn catalog_chunks(transfer_id: u32, monitors: &[MonitorDescriptor]) -> Vec<ProtoEvent> {
+pub fn catalog_chunks(
+    revision: u64,
+    transfer_id: u32,
+    monitors: &[MonitorDescriptor],
+) -> Vec<ProtoEvent> {
     if monitors.is_empty() {
         return vec![ProtoEvent::MonitorCatalogChunk {
+            revision,
             transfer_id,
             index: 0,
             count: 1,
@@ -289,6 +364,7 @@ pub fn catalog_chunks(transfer_id: u32, monitors: &[MonitorDescriptor]) -> Vec<P
         .chunks(lan_mouse_proto::MAX_MONITOR_CATALOG_CHUNK_ITEMS)
         .enumerate()
         .map(|(index, descriptors)| ProtoEvent::MonitorCatalogChunk {
+            revision,
             transfer_id,
             index: index as u16,
             count: count as u16,
@@ -304,6 +380,69 @@ fn proto_position(position: Position) -> lan_mouse_proto::Position {
         Position::Top => lan_mouse_proto::Position::Top,
         Position::Bottom => lan_mouse_proto::Position::Bottom,
     }
+}
+
+pub struct MonitorCatalogSender {
+    revision: u64,
+    transfer_id: u32,
+    chunks: Vec<ProtoEvent>,
+    acknowledged: bool,
+}
+
+impl MonitorCatalogSender {
+    pub fn new(
+        revision: u64,
+        transfer_id: u32,
+        monitors: &[MonitorDescriptor],
+    ) -> Result<Self, GridSnapshotError> {
+        if monitors.len() > lan_mouse_ipc::MAX_MONITOR_GRID_ENTRIES {
+            return Err(GridSnapshotError::TooLarge);
+        }
+        let chunks = catalog_chunks(revision, transfer_id, monitors);
+        if chunks.is_empty() || chunks.len() > MAX_CATALOG_CHUNKS {
+            return Err(GridSnapshotError::TooLarge);
+        }
+        Ok(Self {
+            revision,
+            transfer_id,
+            chunks,
+            acknowledged: false,
+        })
+    }
+
+    pub fn pending_chunks(&self) -> Vec<ProtoEvent> {
+        if self.acknowledged {
+            Vec::new()
+        } else {
+            self.chunks.clone()
+        }
+    }
+
+    pub fn retry_unacknowledged(&self) -> Vec<ProtoEvent> {
+        self.pending_chunks()
+    }
+
+    pub fn acknowledge(&mut self, revision: u64, transfer_id: u32) -> bool {
+        if revision == self.revision && transfer_id == self.transfer_id {
+            self.acknowledged = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorCatalogUpdate {
+    Applied {
+        revision: u64,
+        transfer_id: u32,
+        monitors: Vec<MonitorDescriptor>,
+    },
+    Stale {
+        revision: u64,
+        transfer_id: u32,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -400,7 +539,8 @@ pub struct GridSnapshotReassembler {
 
 #[derive(Default)]
 pub struct MonitorCatalogReassembler {
-    partial: HashMap<u32, PartialCatalog>,
+    partial: HashMap<(u64, u32), PartialCatalog>,
+    highest_revision: Option<u64>,
 }
 
 struct PartialCatalog {
@@ -413,8 +553,9 @@ impl MonitorCatalogReassembler {
     pub fn push(
         &mut self,
         event: ProtoEvent,
-    ) -> Result<Option<Vec<MonitorDescriptor>>, GridSnapshotError> {
+    ) -> Result<Option<MonitorCatalogUpdate>, GridSnapshotError> {
         let ProtoEvent::MonitorCatalogChunk {
+            revision,
             transfer_id,
             index,
             count,
@@ -423,6 +564,15 @@ impl MonitorCatalogReassembler {
         else {
             return Err(GridSnapshotError::InvalidChunk);
         };
+        if self
+            .highest_revision
+            .is_some_and(|highest| revision <= highest)
+        {
+            return Ok(Some(MonitorCatalogUpdate::Stale {
+                revision,
+                transfer_id,
+            }));
+        }
         if count == 0
             || usize::from(count) > MAX_CATALOG_CHUNKS
             || index >= count
@@ -433,34 +583,32 @@ impl MonitorCatalogReassembler {
         {
             return Err(GridSnapshotError::InvalidChunk);
         }
-        if !self.partial.contains_key(&transfer_id) && self.partial.len() >= MAX_PARTIAL_SNAPSHOTS {
+        let key = (revision, transfer_id);
+        if !self.partial.contains_key(&key) && self.partial.len() >= MAX_PARTIAL_SNAPSHOTS {
             if let Some(oldest) = self.partial.keys().min().copied() {
                 self.partial.remove(&oldest);
             }
         }
-        let partial = self
-            .partial
-            .entry(transfer_id)
-            .or_insert_with(|| PartialCatalog {
-                count,
-                chunks: vec![None; usize::from(count)],
-                count_items: 0,
-            });
+        let partial = self.partial.entry(key).or_insert_with(|| PartialCatalog {
+            count,
+            chunks: vec![None; usize::from(count)],
+            count_items: 0,
+        });
         if partial.count != count {
-            self.partial.remove(&transfer_id);
+            self.partial.remove(&key);
             return Err(GridSnapshotError::ConflictingChunks);
         }
         let slot = &mut partial.chunks[usize::from(index)];
         match slot {
             Some(existing) if existing != &descriptors => {
-                self.partial.remove(&transfer_id);
+                self.partial.remove(&key);
                 return Err(GridSnapshotError::ConflictingChunks);
             }
             Some(_) => return Ok(None),
             None => {
                 partial.count_items = partial.count_items.saturating_add(descriptors.len());
                 if partial.count_items > lan_mouse_ipc::MAX_MONITOR_GRID_ENTRIES {
-                    self.partial.remove(&transfer_id);
+                    self.partial.remove(&key);
                     return Err(GridSnapshotError::TooLarge);
                 }
                 *slot = Some(descriptors);
@@ -469,10 +617,7 @@ impl MonitorCatalogReassembler {
         if partial.chunks.iter().any(Option::is_none) {
             return Ok(None);
         }
-        let partial = self
-            .partial
-            .remove(&transfer_id)
-            .expect("completed catalog");
+        let partial = self.partial.remove(&key).expect("completed catalog");
         let monitors = partial
             .chunks
             .into_iter()
@@ -487,7 +632,14 @@ impl MonitorCatalogReassembler {
         {
             return Err(GridSnapshotError::InvalidChunk);
         }
-        Ok(Some(monitors))
+        self.highest_revision = Some(revision);
+        self.partial
+            .retain(|(old_revision, _), _| *old_revision > revision);
+        Ok(Some(MonitorCatalogUpdate::Applied {
+            revision,
+            transfer_id,
+            monitors,
+        }))
     }
 }
 
@@ -498,6 +650,19 @@ struct PartialSnapshot {
 }
 
 impl GridSnapshotReassembler {
+    /// Record a grid that is already authoritative locally, including one loaded
+    /// from disk or edited by this device, so older peer snapshots cannot replace it.
+    pub fn observe_applied(&mut self, grid: &MonitorGrid) {
+        let key = (grid.revision, grid.origin_fingerprint.clone());
+        if self
+            .highest_applied
+            .as_ref()
+            .is_none_or(|current| &key > current)
+        {
+            self.highest_applied = Some(key);
+        }
+    }
+
     pub fn push(
         &mut self,
         event: ProtoEvent,
@@ -585,18 +750,17 @@ impl GridSnapshotReassembler {
         }
         grid.validate()
             .map_err(|_| GridSnapshotError::InvalidChunk)?;
-        let received_key = (revision, origin_fingerprint.clone());
         if self
             .highest_applied
             .as_ref()
-            .is_some_and(|current| &received_key <= current)
+            .is_some_and(|current| &key <= current)
         {
             return Ok(Some(GridSnapshotUpdate::Stale {
                 revision,
                 origin_fingerprint,
             }));
         }
-        self.highest_applied = Some(received_key);
+        self.observe_applied(&grid);
         Ok(Some(GridSnapshotUpdate::Applied(grid)))
     }
 }

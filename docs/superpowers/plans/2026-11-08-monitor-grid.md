@@ -166,7 +166,7 @@ Windows GTK checks are blocked before Rust compilation by unavailable `pkg-confi
 - [x] Document the editor, per-monitor output discovery, equal-cell edge handoff, legacy-peer fallback, and the new TOML layout.
 - [x] Run `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features`, and affected workspace tests on Windows and `gauss`.
 - [x] Build the Windows workspace here and the Linux workspace on `gauss`; record any platform prerequisites that are unavailable.
-- [ ] Review the full diff for protocol compatibility, stale-output handling, documentation accuracy, and any changes outside this feature.
-- [ ] Commit as `docs: explain monitor grid configuration`.
+- [x] Review the full diff for protocol compatibility, stale-output handling, documentation accuracy, and any changes outside this feature.
+- [x] Commit as `docs: explain monitor grid configuration`.
 
 Verification results: the full Linux workspace build on Gauss passed. The Windows app target without GTK passed; the Windows full workspace build and GTK tests stop at missing `pkg-config` and native GTK/Pango development dependencies. Full workspace Clippy on Gauss is blocked by the pre-existing `input-emulation/examples/double_click.rs` constructor call; Windows workspace Clippy is blocked by the same GTK prerequisites. Workspace `cargo fmt --check` reports only the pre-existing formatting in `lan-mouse-gtk/src/linux_tray.rs`; all Rust files changed for this feature pass targeted rustfmt checks. Affected tests pass on both hosts, with the GTK model test running on Gauss.
