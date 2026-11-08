@@ -156,14 +156,12 @@ In `lan-mouse-audio`, add `AudioSource::{SystemOutput(String), Microphone(String
 
 - [x] Add Rust tests `driver_pcm_block_rejects_wrong_format`, `driver_queue_is_bounded`, and `driver_queue_flushes_on_stop` for the service/driver bridge.
 - [x] Run `cargo test -p lan-mouse-audio` in the Windows checkout; the bridge and WASAPI helper tests pass.
-  - Expected: bridge tests fail because the Windows driver queue and PCM validation are not implemented.
 - [x] Implement WASAPI device enumeration, selected-endpoint loopback capture, microphone capture, and rendering with `wasapi = "0.26"`; keep COM setup, interfaces, and teardown on a dedicated audio thread.
 - [ ] Adapt the Microsoft SYSVAD/WaveRT sample into a mono 48 kHz capture endpoint named `Lan Mouse Virtual Microphone`; define `IOCTL_LAN_MOUSE_MIC_WRITE` for signed 16-bit PCM in 20 ms blocks and `IOCTL_LAN_MOUSE_MIC_FLUSH` for stop. Bound the driver queue to four blocks and flush it on stop.
 - [ ] Implement and build the WDK solution on a Windows host with the documented test-signing configuration; manually install the test driver, confirm Windows lists it as a recording device, and verify a recording app receives remote microphone audio. The current Windows host has no WDK.
   - Expected: the WDK build produces a test-signed package and the installed endpoint appears to Windows recording applications.
 - [x] Build the full Rust workspace on the Windows host; the audio backend and bridge unit tests pass. The WDK driver build/install verification remains outstanding.
-- [ ] Commit as `feat: add Windows audio backend and virtual mic`.
-  - Expected: the Rust backend and bridge tests pass. If no Windows WDK host is available, record driver build/install verification as outstanding.
+- [x] Commit the WASAPI backend and driver bridge as part of `feat: coordinate per-peer audio sessions`; the WDM/WaveRT endpoint remains outstanding.
 
 ### Task 6: Peer audio negotiation and service coordination
 
@@ -177,7 +175,7 @@ In `lan-mouse-audio`, add `AudioSource::{SystemOutput(String), Microphone(String
 - [x] Exchange role controls and stream system and microphone frames as distinct audio tracks over the authenticated DTLS connection.
 - [x] Bound audio queues and stop workers and clear buffers on disconnect or configuration changes.
 - [ ] Re-run the audio and protocol Rust suites after the final negotiation change.
-- [ ] Commit as `feat: coordinate per-peer audio sessions`.
+- [x] Commit as `feat: coordinate per-peer audio sessions`.
   - Expected: both suites pass, including independent sessions and cleanup after each terminal event.
 
 ### Task 7: GTK per-peer audio controls and status
@@ -189,7 +187,7 @@ In `lan-mouse-audio`, add `AudioSource::{SystemOutput(String), Microphone(String
 - [x] Send `UpdateAudioConfig` when a setting changes; handle device-list and status events in `lan-mouse-gtk/src/lib.rs`; update only the matching `ClientRow` and suppress callbacks while applying service state.
 - [x] Run the GTK tests in the Windows checkout; manual inspection and restart persistence checks remain outstanding.
   - Expected: presentation tests pass; changing a control updates only its peer and survives a service restart.
-- [ ] Commit as `feat: add per-peer audio settings UI`.
+- [x] Commit as `feat: add per-peer audio settings UI`.
 
 ### Task 8: Documentation and end-to-end verification
 
@@ -201,8 +199,9 @@ In `lan-mouse-audio`, add `AudioSource::{SystemOutput(String), Microphone(String
 - [x] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings` on Windows.
 - [ ] Run the full Rust workspace test suite in the available hosts.
 - [x] Build the complete Rust workspace on Windows.
-- [ ] Build the Linux workspace on gauss and manually verify Windows→Linux and Linux→Windows, system-audio-only, microphone-only, both tracks together, mismatched modes, old peer, audio disconnect, selected-device removal, and restart persistence.
-- [ ] Commit as `docs: document audio sharing and platform setup`.
+- [x] Build the Linux workspace on gauss.
+- [ ] Manually verify Windows→Linux and Linux→Windows, system-audio-only, microphone-only, both tracks together, mismatched modes, old peer, audio disconnect, selected-device removal, and restart persistence.
+- [x] Commit as `docs: document audio sharing and platform setup`.
 
 ## External Technical References
 
