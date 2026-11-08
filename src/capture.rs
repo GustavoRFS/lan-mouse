@@ -25,6 +25,17 @@ pub(crate) struct Capture {
     audio_event_rx: tokio::sync::mpsc::Receiver<ICaptureEvent>,
 }
 
+#[derive(Clone)]
+pub(crate) struct AudioSender(Sender<CaptureRequest>);
+
+impl AudioSender {
+    pub(crate) fn send(&self, handle: u64, message: AudioMessage) {
+        self.0
+            .send(CaptureRequest::Audio { handle, message })
+            .expect("capture channel closed");
+    }
+}
+
 pub(crate) enum ICaptureEvent {
     /// a client was entered
     CaptureBegin(CaptureHandle),
@@ -86,6 +97,10 @@ enum CaptureRequest {
         payload: ClipboardPayload,
     },
     CancelClipboardTransfers,
+    Audio {
+        handle: u64,
+        message: AudioMessage,
+    },
 }
 
 impl Capture {
@@ -184,6 +199,10 @@ impl Capture {
             .send(CaptureRequest::CancelClipboardTransfers)
             .expect("channel closed");
     }
+
+    pub(crate) fn audio_sender(&self) -> AudioSender {
+        AudioSender(self.request_tx.clone())
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -267,6 +286,11 @@ impl CaptureTask {
                         }
                         CaptureRequest::CancelClipboardTransfers => {
                             self.conn.cancel_clipboard_transfers().await;
+                        }
+                        CaptureRequest::Audio { handle, message } => {
+                            if let Err(error) = self.conn.send_audio(message, handle).await {
+                                log::debug!("audio send to client {handle} deferred: {error}");
+                            }
                         }
                     },
                     (handle, event) = self.conn.recv() => {
@@ -414,6 +438,11 @@ impl CaptureTask {
                     }
                     CaptureRequest::CancelClipboardTransfers => {
                         self.conn.cancel_clipboard_transfers().await;
+                    }
+                    CaptureRequest::Audio { handle, message } => {
+                        if let Err(error) = self.conn.send_audio(message, handle).await {
+                            log::debug!("audio send to client {handle} deferred: {error}");
+                        }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

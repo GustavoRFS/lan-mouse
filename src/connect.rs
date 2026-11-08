@@ -39,6 +39,8 @@ pub(crate) enum LanMouseConnectionError {
     Dtls(#[from] webrtc_dtls::Error),
     #[error(transparent)]
     Webrtc(#[from] webrtc_util::Error),
+    #[error(transparent)]
+    AudioProtocol(#[from] lan_mouse_proto::ProtocolError),
     #[error("not connected")]
     NotConnected,
     #[error("emulation is disabled on the target device")]
@@ -234,6 +236,53 @@ impl LanMouseConnection {
         if !connecting.contains(&handle) {
             connecting.insert(handle);
             // connect in the background
+            spawn_local(connect_to_handle(
+                self.client_manager.clone(),
+                self.cert.clone(),
+                handle,
+                self.conns.clone(),
+                self.connecting.clone(),
+                self.recv_tx.clone(),
+                self.audio_tx.clone(),
+                self.ping_response.clone(),
+                self.reassembler.clone(),
+            ));
+        }
+        Err(LanMouseConnectionError::NotConnected)
+    }
+
+    pub(crate) async fn send_audio(
+        &self,
+        message: AudioMessage,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        let bytes = lan_mouse_proto::encode_audio_message(&message)?;
+        if let Some(addr) = self.client_manager.active_addr(handle) {
+            let connection = {
+                let conns = self.conns.lock().await;
+                conns.get(&addr).cloned()
+            };
+            if let Some(connection) = connection {
+                if let Err(error) = connection.conn.send(&bytes).await {
+                    log::warn!("client {handle} failed to send audio: {error}");
+                    disconnect(
+                        &self.client_manager,
+                        handle,
+                        addr,
+                        &self.conns,
+                        &self.recv_tx,
+                    )
+                    .await;
+                    return Err(error.into());
+                }
+                log::trace!("audio frame sent to {addr}");
+                return Ok(());
+            }
+        }
+
+        let mut connecting = self.connecting.lock().await;
+        if !connecting.contains(&handle) {
+            connecting.insert(handle);
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
                 self.cert.clone(),

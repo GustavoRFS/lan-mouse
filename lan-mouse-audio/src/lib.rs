@@ -1,13 +1,18 @@
 mod buffer;
 mod codec;
+pub mod session;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use buffer::{PLAYOUT_FRAMES_PER_TRACK, PlayoutBuffer};
 pub use codec::{AudioDecoder, AudioEncoder};
 pub use lan_mouse_ipc::{AudioDevice, AudioDeviceDirection};
 pub use lan_mouse_proto::{AudioTrack, MAX_AUDIO_DATAGRAM_SIZE};
+pub use session::{AudioNegotiation, AudioSessionState};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 

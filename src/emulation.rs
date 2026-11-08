@@ -73,6 +73,7 @@ pub(crate) enum EmulationEvent {
     },
     Audio {
         addr: SocketAddr,
+        fingerprint: String,
         message: AudioMessage,
     },
 }
@@ -223,9 +224,9 @@ impl ListenTask {
                     Some(ListenEvent::Clipboard { update_id, payload, addr }) => {
                         self.event_tx.send(EmulationEvent::Clipboard { addr, update_id, payload }).expect("channel closed");
                     }
-                    Some(ListenEvent::Audio { addr, message }) => {
+                    Some(ListenEvent::Audio { addr, fingerprint, message }) => {
                         last_response.insert(addr, Instant::now());
-                        if let Err(error) = self.audio_event_tx.try_send(EmulationEvent::Audio { addr, message }) {
+                        if let Err(error) = self.audio_event_tx.try_send(EmulationEvent::Audio { addr, fingerprint, message }) {
                             log::debug!("dropping audio event from {addr}: {error}");
                         }
                     }

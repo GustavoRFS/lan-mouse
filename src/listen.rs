@@ -52,6 +52,7 @@ pub(crate) enum ListenEvent {
     },
     Audio {
         addr: SocketAddr,
+        fingerprint: String,
         message: AudioMessage,
     },
     Disconnected {
@@ -69,7 +70,7 @@ pub(crate) enum ListenEvent {
 pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
-    audio_rx: tokio::sync::mpsc::Receiver<(SocketAddr, AudioMessage)>,
+    audio_rx: tokio::sync::mpsc::Receiver<(SocketAddr, String, AudioMessage)>,
     prefer_audio: bool,
     listen_task: JoinHandle<()>,
     conns: Rc<AsyncMutex<Vec<IncomingConnection>>>,
@@ -161,17 +162,17 @@ impl LanMouseListener {
                                 log::info!("dtls client connected, ip: {addr}");
                                 let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), addr, reassembler.clone()));
                                 clipboard.advertise().await;
+                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+                                let certs = dtls_conn.connection_state().await.peer_certificates;
+                                let cert = certs.first().expect("cert");
+                                let fingerprint = crypto::generate_fingerprint(cert);
                                 conns_clone.lock().await.push(IncomingConnection {
                                     addr,
                                     conn: conn.clone(),
                                     clipboard: clipboard.clone(),
                                 });
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-                                let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
-                                let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, clipboard, listen_tx.clone(), audio_tx.clone()));
+                                listen_tx.send(ListenEvent::Accept { addr, fingerprint: fingerprint.clone() }).expect("channel closed");
+                                spawn_local(read_loop(conns_clone.clone(), addr, fingerprint, conn, clipboard, listen_tx.clone(), audio_tx.clone()));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -312,8 +313,12 @@ impl Stream for LanMouseListener {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
         let audio_event = match this.audio_rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some((addr, message))) => {
-                Some(ListenEvent::Audio { addr, message })
+            std::task::Poll::Ready(Some((addr, fingerprint, message))) => {
+                Some(ListenEvent::Audio {
+                    addr,
+                    fingerprint,
+                    message,
+                })
             }
             std::task::Poll::Ready(None) | std::task::Poll::Pending => None,
         };
@@ -336,10 +341,11 @@ impl Stream for LanMouseListener {
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<IncomingConnection>>>,
     addr: SocketAddr,
+    fingerprint: String,
     conn: ArcConn,
     clipboard: Arc<ClipboardPeer>,
     dtls_tx: Sender<ListenEvent>,
-    audio_tx: tokio::sync::mpsc::Sender<(SocketAddr, AudioMessage)>,
+    audio_tx: tokio::sync::mpsc::Sender<(SocketAddr, String, AudioMessage)>,
 ) -> Result<(), Error> {
     let mut b = [0u8; 2048];
 
@@ -369,7 +375,7 @@ async fn read_loop(
             }
             match decode_audio_message(&b[..len]) {
                 Ok(message) => {
-                    if let Err(error) = audio_tx.try_send((addr, message)) {
+                    if let Err(error) = audio_tx.try_send((addr, fingerprint.clone(), message)) {
                         log::debug!("dropping audio frame from {addr}: {error}");
                     }
                 }

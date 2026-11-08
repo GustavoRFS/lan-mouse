@@ -118,6 +118,19 @@ impl ClientManager {
             .map(|p| p as ClientHandle)
     }
 
+    /// Find the unique configured peer at this address, including inactive peers.
+    /// An ambiguous address is deliberately rejected so audio cannot be routed to
+    /// an arbitrary client when several configurations share one host.
+    pub(crate) fn get_audio_client_for_ip(&self, ip: IpAddr) -> Option<ClientHandle> {
+        let clients = self.clients.borrow();
+        let mut matches = clients
+            .iter()
+            .filter(|(_, (_, state))| state.ips.contains(&ip))
+            .map(|(handle, _)| handle as ClientHandle);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
     /// get the client at the given position
     pub fn client_at(&self, pos: Position) -> Option<ClientHandle> {
         self.clients
@@ -348,6 +361,7 @@ impl ClientManager {
 mod audio_tests {
     use super::ClientManager;
     use lan_mouse_ipc::{AudioConfig, AudioMode};
+    use std::{collections::HashSet, net::IpAddr};
 
     #[test]
     fn audio_config_update_changes_only_the_selected_client() {
@@ -366,5 +380,39 @@ mod audio_tests {
         assert_eq!(first_config.audio, config);
         assert_eq!(second_config.audio, AudioConfig::default());
         assert!(!manager.set_audio_config(u64::MAX, AudioConfig::default()));
+    }
+
+    #[test]
+    fn audio_peer_lookup_includes_inactive_clients() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        let ip = "192.0.2.14".parse::<IpAddr>().unwrap();
+        manager.set_state(
+            handle,
+            lan_mouse_ipc::ClientState {
+                ips: HashSet::from([ip]),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(manager.get_audio_client_for_ip(ip), Some(handle));
+    }
+
+    #[test]
+    fn audio_peer_lookup_rejects_ambiguous_addresses() {
+        let manager = ClientManager::default();
+        let ip = "192.0.2.14".parse::<IpAddr>().unwrap();
+        for _ in 0..2 {
+            let handle = manager.add_client();
+            manager.set_state(
+                handle,
+                lan_mouse_ipc::ClientState {
+                    ips: HashSet::from([ip]),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(manager.get_audio_client_for_ip(ip), None);
     }
 }
