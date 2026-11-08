@@ -156,6 +156,15 @@ impl InputEmulation {
         Err(EmulationCreationError::NoAvailableBackend)
     }
 
+    /// Change the keymap used by backends that provide their own virtual keyboard.
+    pub async fn set_keyboard_layout(
+        &mut self,
+        layout: Option<&str>,
+        variant: Option<&str>,
+    ) -> Result<(), EmulationError> {
+        self.emulation.set_keyboard_layout(layout, variant).await
+    }
+
     pub async fn consume(
         &mut self,
         event: Event,
@@ -257,4 +266,11 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    async fn set_keyboard_layout(
+        &mut self,
+        _layout: Option<&str>,
+        _variant: Option<&str>,
+    ) -> Result<(), EmulationError> {
+        Ok(())
+    }
 }

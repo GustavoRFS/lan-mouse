@@ -239,6 +239,12 @@ impl Service {
                 self.update_pos(handle, pos);
                 self.save_config();
             }
+            FrontendRequest::UpdateKeyboardLayout(handle, layout) => {
+                if self.client_manager.set_keyboard_layout(handle, layout) {
+                    self.broadcast_client(handle);
+                    self.save_config();
+                }
+            }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
@@ -284,6 +290,7 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                keyboard_layout: c.keyboard_layout,
             })
             .collect();
         self.config.set_clients(clients);

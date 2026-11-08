@@ -33,8 +33,8 @@ input-emulation = { path = "input-emulation", version = "0.4.0", default-feature
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
-lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.4.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.4.0" }
+lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.5.0" }
+lan-mouse-proto = { path = "lan-mouse-proto", version = "0.5.0" }
 lan-mouse-transfer = { path = "lan-mouse-transfer", version = "0.1.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
@@ -81,6 +81,8 @@ windows = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [features]

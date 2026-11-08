@@ -25,6 +25,8 @@ pub struct ClientRow {
     #[template_child]
     pub position: TemplateChild<ComboRow>,
     #[template_child]
+    pub keyboard_layout: TemplateChild<ComboRow>,
+    #[template_child]
     pub delete_row: TemplateChild<ActionRow>,
     #[template_child]
     pub delete_button: TemplateChild<gtk::Button>,
@@ -34,6 +36,7 @@ pub struct ClientRow {
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,
     position_change_handler: RefCell<Option<SignalHandlerId>>,
+    keyboard_layout_change_handler: RefCell<Option<SignalHandlerId>>,
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub client_object: RefCell<Option<ClientObject>>,
 }
@@ -91,6 +94,14 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.position_change_handler.replace(Some(handler));
+        let handler = self.keyboard_layout.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |keyboard_layout| {
+                row.handle_keyboard_layout_changed(keyboard_layout);
+            }
+        ));
+        self.keyboard_layout_change_handler.replace(Some(handler));
         let handler = self.enable_switch.connect_state_set(clone!(
             #[weak(rename_to = row)]
             self,
@@ -121,6 +132,9 @@ impl ObjectImpl for ClientRow {
                     .build(),
                 Signal::builder("request-position-change")
                     .param_types([u32::static_type()])
+                    .build(),
+                Signal::builder("request-keyboard-layout-change")
+                    .param_types([String::static_type()])
                     .build(),
             ]
         })
@@ -162,6 +176,18 @@ impl ClientRow {
             .emit_by_name("request-position-change", &[&position.selected()])
     }
 
+    fn handle_keyboard_layout_changed(&self, keyboard_layout: &ComboRow) {
+        let layout = match keyboard_layout.selected() {
+            1 => "es",
+            2 => "br",
+            3 => "latam",
+            _ => "",
+        }
+        .to_string();
+        self.obj()
+            .emit_by_name("request-keyboard-layout-change", &[&layout]);
+    }
+
     pub(super) fn set_hostname(&self, hostname: Option<String>) {
         let position = self.hostname.position();
         let handler = self.hostname_change_handler.borrow();
@@ -200,6 +226,18 @@ impl ClientRow {
             .expect("client object")
             .set_position(pos.to_string());
         self.position.unblock_signal(handler);
+    }
+
+    pub(super) fn set_keyboard_layout(&self, layout: Option<String>) {
+        let handler = self.keyboard_layout_change_handler.borrow();
+        let handler = handler.as_ref().expect("keyboard layout signal handler");
+        self.keyboard_layout.block_signal(handler);
+        self.client_object
+            .borrow_mut()
+            .as_mut()
+            .expect("client object")
+            .set_property("keyboard-layout", layout.unwrap_or_default());
+        self.keyboard_layout.unblock_signal(handler);
     }
 
     pub(super) fn set_active(&self, active: bool) {

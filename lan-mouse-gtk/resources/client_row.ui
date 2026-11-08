@@ -69,6 +69,23 @@
 				</property>
 			</object>
 		</child>
+		<!-- keyboard layout sent to this client -->
+		<child>
+			<object class="AdwComboRow" id="keyboard_layout">
+				<property name="title" translatable="yes">keyboard layout</property>
+				<property name="subtitle" translatable="yes">automatic follows the active Windows app</property>
+				<property name="model">
+					<object class="GtkStringList">
+						<items>
+							<item>Automatic (Windows)</item>
+							<item>Spanish (Spain)</item>
+							<item>Portuguese (Brazil)</item>
+							<item>Spanish (Latin America)</item>
+						</items>
+					</object>
+				</property>
+			</object>
+		</child>
 		<!-- delete button -->
 		<child>
 			<object class="AdwActionRow" id="delete_row">

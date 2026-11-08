@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse-ipc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "futures",
  "log",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse-proto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "input-event",
  "num_enum",

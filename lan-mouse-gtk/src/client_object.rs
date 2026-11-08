@@ -16,6 +16,10 @@ impl ClientObject {
             .property("hostname", client.hostname)
             .property("port", client.port as u32)
             .property("position", client.pos.to_string())
+            .property(
+                "keyboard-layout",
+                client.keyboard_layout.unwrap_or_default(),
+            )
             .property("active", state.active)
             .property(
                 "ips",
@@ -53,4 +57,5 @@ pub struct ClientData {
     pub resolving: bool,
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
+    pub keyboard_layout: String,
 }

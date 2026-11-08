@@ -46,7 +46,9 @@ type Keymap = (u32, OwnedFd, u32);
 struct State {
     /// the compositor's keymap, as of the last time it sent one
     keymap: Option<Keymap>,
-    /// keymap built from the configured layout, which takes the compositor's place
+    /// keymap configured on the receiving machine, which is the fallback for remote layouts
+    configured_keymap: Option<Keymap>,
+    /// keymap currently selected by the sending machine
     fixed_keymap: Option<Keymap>,
     /// shared by all clients, so the keymap fd is sent once instead of once per client
     keyboard: Option<Vk>,
@@ -82,7 +84,7 @@ impl WlrootsEmulation {
             .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
 
         let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
-        let fixed_keymap = options.keyboard_layout.as_deref().and_then(|layout| {
+        let configured_keymap = options.keyboard_layout.as_deref().and_then(|layout| {
             let variant = options.keyboard_variant.as_deref().unwrap_or_default();
             match fixed_keymap(layout, variant) {
                 Ok(keymap) => {
@@ -100,7 +102,8 @@ impl WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
-                fixed_keymap,
+                configured_keymap,
+                fixed_keymap: None,
                 keyboard: None,
                 input_for_client,
                 seat,
@@ -110,7 +113,7 @@ impl WlrootsEmulation {
             },
             queue,
         };
-        while emulate.state.keymap.is_none() && emulate.state.fixed_keymap.is_none() {
+        while emulate.state.keymap.is_none() && emulate.state.configured_keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
         }
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
@@ -129,7 +132,11 @@ impl State {
             None => {
                 let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
                 // TODO: use server side keymap
-                let Some((format, fd, size)) = self.fixed_keymap.as_ref().or(self.keymap.as_ref())
+                let Some((format, fd, size)) = self
+                    .fixed_keymap
+                    .as_ref()
+                    .or(self.configured_keymap.as_ref())
+                    .or(self.keymap.as_ref())
                 else {
                     panic!("no keymap");
                 };
@@ -208,6 +215,39 @@ impl Emulation for WlrootsEmulation {
     }
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    async fn set_keyboard_layout(
+        &mut self,
+        layout: Option<&str>,
+        variant: Option<&str>,
+    ) -> Result<(), EmulationError> {
+        let fixed_keymap = match layout {
+            Some(layout) => match fixed_keymap(layout, variant.unwrap_or_default()) {
+                Ok(keymap) => Some(keymap),
+                Err(KeymapError::Unknown { layout, variant }) => {
+                    log::error!("xkb has no keymap for layout `{layout}` with variant `{variant}`");
+                    return Ok(());
+                }
+                Err(KeymapError::Io(error)) => return Err(error.into()),
+            },
+            None => None,
+        };
+
+        let Some((format, fd, size)) = fixed_keymap
+            .as_ref()
+            .or(self.state.configured_keymap.as_ref())
+            .or(self.state.keymap.as_ref())
+        else {
+            log::error!("no keymap is available for the virtual keyboard");
+            return Ok(());
+        };
+        if let Some(keyboard) = self.state.keyboard.as_ref() {
+            keyboard.keymap(*format, fd.as_fd(), *size);
+            self.queue.flush()?;
+        }
+        self.state.fixed_keymap = fixed_keymap;
+        Ok(())
     }
 }
 
@@ -487,6 +527,7 @@ mod tests {
     fn fixed_keymap_holds_a_single_layout() {
         let keymap = keymap_of(&keymap_text("es", "").unwrap());
         assert_eq!(keymap.num_layouts(), 1);
+        assert_eq!(keymap_of(&keymap_text("br", "").unwrap()).num_layouts(), 1);
     }
 
     #[test]

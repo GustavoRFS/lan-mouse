@@ -84,6 +84,7 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    keyboard_layout: Option<String>,
 }
 
 impl ConfigToml {
@@ -284,6 +285,7 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    pub keyboard_layout: Option<String>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -291,6 +293,7 @@ impl From<TomlClient> for ConfigClient {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
         let leave_hook = toml.leave_hook;
+        let keyboard_layout = toml.keyboard_layout;
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
@@ -303,6 +306,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            keyboard_layout,
         }
     }
 }
@@ -323,6 +327,7 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
+        let keyboard_layout = client.keyboard_layout;
         Self {
             hostname,
             host_name,
@@ -332,6 +337,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            keyboard_layout,
         }
     }
 }
@@ -552,10 +558,7 @@ impl Config {
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
-        self.config_toml
-            .as_mut()
-            .expect("config")
-            .clipboard_sharing = Some(enabled);
+        self.config_toml.as_mut().expect("config").clipboard_sharing = Some(enabled);
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
@@ -642,5 +645,38 @@ mod tests {
         let config: ConfigToml = toml::from_str("port = 4242").unwrap();
         assert_eq!(config.keyboard_layout, None);
         assert_eq!(config.keyboard_variant, None);
+    }
+
+    #[test]
+    fn client_keyboard_layout_is_loaded_from_config() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+            [[clients]]
+            hostname = "target"
+            position = "right"
+            keyboard_layout = "br"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.clients.unwrap()[0].keyboard_layout.as_deref(),
+            Some("br")
+        );
+    }
+
+    #[test]
+    fn client_keyboard_layout_round_trips_through_config_types() {
+        let toml_client: TomlClient = toml::from_str(
+            r#"
+            hostname = "target"
+            position = "right"
+            keyboard_layout = "es"
+            "#,
+        )
+        .unwrap();
+        let config_client = ConfigClient::from(toml_client);
+        assert_eq!(config_client.keyboard_layout.as_deref(), Some("es"));
+        let toml_client = TomlClient::from(config_client);
+        assert_eq!(toml_client.keyboard_layout.as_deref(), Some("es"));
     }
 }

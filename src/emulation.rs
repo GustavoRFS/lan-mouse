@@ -4,7 +4,7 @@ use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{ClipboardUpdateId, Position, ProtoEvent};
+use lan_mouse_proto::{ClipboardUpdateId, KeyboardLayout, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -15,6 +15,7 @@ use std::{
 };
 use tokio::{
     select,
+    sync::oneshot,
     task::{JoinHandle, spawn_local},
 };
 
@@ -176,6 +177,11 @@ impl ListenTask {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
+                            ProtoEvent::KeyboardLayout(layout) => {
+                                if let Err(error) = self.emulation_proxy.set_keyboard_layout(addr, layout).await {
+                                    log::warn!("failed to apply keyboard layout from {addr}: {error}");
+                                }
+                            }
                             ProtoEvent::Enter(pos) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
@@ -275,6 +281,11 @@ pub(crate) struct EmulationProxy {
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
+    SetKeyboardLayout {
+        addr: SocketAddr,
+        layout: Option<KeyboardLayout>,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     Terminate,
     Reenable,
 }
@@ -296,6 +307,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            keyboard_layout_source: None,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -333,6 +345,24 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    async fn set_keyboard_layout(
+        &self,
+        addr: SocketAddr,
+        layout: Option<KeyboardLayout>,
+    ) -> Result<(), String> {
+        let (response, response_rx) = oneshot::channel();
+        self.request_tx
+            .send(ProxyRequest::SetKeyboardLayout {
+                addr,
+                layout,
+                response,
+            })
+            .expect("channel closed");
+        response_rx
+            .await
+            .unwrap_or_else(|_| Err("input emulation stopped before applying the layout".into()))
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -356,6 +386,7 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    keyboard_layout_source: Option<(SocketAddr, Option<KeyboardLayout>)>,
 }
 
 impl EmulationTask {
@@ -373,7 +404,23 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Remove(addr) => {
+                        self.handles.remove(&addr);
+                        if self
+                            .keyboard_layout_source
+                            .is_some_and(|(source, _)| source == addr)
+                        {
+                            self.keyboard_layout_source = None;
+                        }
+                    }
+                    ProxyRequest::SetKeyboardLayout {
+                        addr,
+                        layout,
+                        response,
+                    } => {
+                        self.keyboard_layout_source = Some((addr, layout));
+                        let _ = response.send(Ok(()));
+                    }
                 }
             }
         }
@@ -381,11 +428,40 @@ impl EmulationTask {
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
-        let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend, self.options.clone()) => r?,
-            // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+        let creation = InputEmulation::new(self.backend, self.options.clone());
+        tokio::pin!(creation);
+        let mut pending_layout_responses = Vec::new();
+        let mut emulation = loop {
+            tokio::select! {
+                result = &mut creation => break result?,
+                request = self.request_rx.recv() => match request.expect("channel closed") {
+                    ProxyRequest::Terminate => return Ok(()),
+                    ProxyRequest::SetKeyboardLayout { addr, layout, response } => {
+                        self.keyboard_layout_source = Some((addr, layout));
+                        pending_layout_responses.push(response);
+                    }
+                    ProxyRequest::Remove(addr) => {
+                        self.handles.remove(&addr);
+                        if self.keyboard_layout_source.is_some_and(|(source, _)| source == addr) {
+                            self.keyboard_layout_source = None;
+                        }
+                    }
+                    ProxyRequest::Input(..) | ProxyRequest::Reenable => {}
+                }
+            }
         };
+
+        if let Some((_, layout)) = self.keyboard_layout_source {
+            if let Err(error) = self.apply_keyboard_layout(&mut emulation, layout).await {
+                for response in pending_layout_responses {
+                    let _ = response.send(Err(error.to_string()));
+                }
+                return Err(error);
+            }
+        }
+        for response in pending_layout_responses {
+            let _ = response.send(Ok(()));
+        }
 
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
@@ -395,9 +471,16 @@ impl EmulationTask {
         );
 
         // create active handles
-        if let Err(e) = self.create_clients(&mut emulation).await {
-            emulation.terminate().await;
-            return Err(e);
+        match self.create_clients(&mut emulation).await {
+            Ok(true) => {
+                emulation.terminate().await;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                emulation.terminate().await;
+                return Err(error);
+            }
         }
 
         let res = self.do_emulation_session(&mut emulation).await;
@@ -409,13 +492,46 @@ impl EmulationTask {
     async fn create_clients(
         &mut self,
         emulation: &mut InputEmulation,
-    ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
+    ) -> Result<bool, InputEmulationError> {
+        let handles = self.handles.values().copied().collect::<Vec<_>>();
+        let mut pending_layout_responses = Vec::new();
+        for handle in handles {
             tokio::select! {
-                _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                _ = emulation.create(handle) => {},
+                request = self.request_rx.recv() => match request.expect("channel closed") {
+                    ProxyRequest::Terminate => return Ok(true),
+                    ProxyRequest::SetKeyboardLayout { addr, layout, response } => {
+                        self.keyboard_layout_source = Some((addr, layout));
+                        pending_layout_responses.push(response);
+                    }
+                    ProxyRequest::Input(..) | ProxyRequest::Remove(..) | ProxyRequest::Reenable => {}
+                }
             }
         }
+        if !pending_layout_responses.is_empty() {
+            if let Some((_, layout)) = self.keyboard_layout_source {
+                self.apply_keyboard_layout(emulation, layout).await?;
+            }
+            for response in pending_layout_responses {
+                let _ = response.send(Ok(()));
+            }
+        }
+        Ok(false)
+    }
+
+    async fn apply_keyboard_layout(
+        &self,
+        emulation: &mut InputEmulation,
+        layout: Option<KeyboardLayout>,
+    ) -> Result<(), InputEmulationError> {
+        let (layout, variant) = match layout {
+            Some(layout) => (Some(layout.xkb_name()), None),
+            None => (
+                self.options.keyboard_layout.as_deref(),
+                self.options.keyboard_variant.as_deref(),
+            ),
+        };
+        emulation.set_keyboard_layout(layout, variant).await?;
         Ok(())
     }
 
@@ -443,6 +559,23 @@ impl EmulationTask {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
+                        if self.keyboard_layout_source.is_some_and(|(source, _)| source == addr) {
+                            self.keyboard_layout_source = None;
+                            self.apply_keyboard_layout(emulation, None).await?;
+                        }
+                    }
+                    ProxyRequest::SetKeyboardLayout { addr, layout, response } => {
+                        let changed = self.keyboard_layout_source != Some((addr, layout));
+                        let result = if changed {
+                            self.apply_keyboard_layout(emulation, layout).await
+                        } else {
+                            Ok(())
+                        };
+                        if result.is_ok() {
+                            self.keyboard_layout_source = Some((addr, layout));
+                        }
+                        let result = result.map_err(|error| error.to_string());
+                        let _ = response.send(result);
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
@@ -458,17 +591,6 @@ fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
         Position::Right => lan_mouse_ipc::Position::Right,
         Position::Top => lan_mouse_ipc::Position::Top,
         Position::Bottom => lan_mouse_ipc::Position::Bottom,
-    }
-}
-
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
-    loop {
-        match rx.recv().await.expect("channel closed") {
-            ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Remove(_) => continue,
-            ProxyRequest::Reenable => continue,
-        }
     }
 }
 

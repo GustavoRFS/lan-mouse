@@ -17,6 +17,7 @@ pub struct ClientObject {
     #[property(name = "port", get, set, type = u32, member = port, maximum = u16::MAX as u32)]
     #[property(name = "active", get, set, type = bool, member = active)]
     #[property(name = "position", get, set, type = String, member = position)]
+    #[property(name = "keyboard-layout", get, set, type = String, member = keyboard_layout)]
     #[property(name = "resolving", get, set, type = bool, member = resolving)]
     #[property(name = "ips", get, set, type = Vec<String>, member = ips)]
     #[property(name = "peer-commit", get, set, type = Option<String>, member = peer_commit)]

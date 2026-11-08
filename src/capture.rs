@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::clipboard::ClipboardPayload;
 use crate::connect::{LanMouseConnection, NetworkEvent};
+use crate::keyboard_layout;
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -99,6 +100,8 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            last_keyboard_layout: None,
+            keyboard_layout_synced: false,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -199,6 +202,8 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    last_keyboard_layout: Option<lan_mouse_proto::KeyboardLayout>,
+    keyboard_layout_synced: bool,
 }
 
 impl CaptureTask {
@@ -414,16 +419,50 @@ impl CaptureTask {
             return Ok(());
         }
 
+        let is_begin = event == CaptureEvent::Begin;
+
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if is_begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            self.last_keyboard_layout = None;
+            self.keyboard_layout_synced = false;
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
         }
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+
+        // The layout event must precede Enter and the first key. While waiting
+        // for Enter's acknowledgment, repeat it because an initial send can
+        // trigger the background DTLS connection and be dropped as a result.
+        let keyboard_activity =
+            is_begin || matches!(&event, CaptureEvent::Input(Event::Keyboard(_)));
+        let keyboard_layout = if keyboard_activity {
+            let configured_layout = self.conn.keyboard_layout(handle);
+            keyboard_layout::effective_layout(configured_layout.as_deref())
+        } else {
+            self.last_keyboard_layout
+        };
+        if is_begin
+            || self.state == State::WaitingForAck
+            || !self.keyboard_layout_synced
+            || (keyboard_activity && self.last_keyboard_layout != keyboard_layout)
+        {
+            if let Err(e) = self
+                .conn
+                .send(ProtoEvent::KeyboardLayout(keyboard_layout), handle)
+                .await
+            {
+                const DUR: Duration = Duration::from_millis(500);
+                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                self.release_capture(capture).await?;
+                return Ok(());
+            }
+            self.last_keyboard_layout = keyboard_layout;
+            self.keyboard_layout_synced = true;
+        }
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
@@ -449,6 +488,8 @@ impl CaptureTask {
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            self.last_keyboard_layout = None;
+            self.keyboard_layout_synced = false;
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer

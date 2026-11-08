@@ -34,6 +34,7 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            keyboard_layout: config_client.keyboard_layout,
         };
         let state = ClientState {
             active: config_client.active,
@@ -128,6 +129,24 @@ impl ClientManager {
             .borrow_mut()
             .get_mut(handle as usize)
             .and_then(|(c, _)| c.hostname.clone())
+    }
+
+    /// keyboard layout selected for the given outgoing client (none means auto-detect).
+    pub(crate) fn get_keyboard_layout(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(config, _)| config.keyboard_layout.clone())
+    }
+
+    /// update the keyboard layout selected for the given outgoing client.
+    pub fn set_keyboard_layout(&self, handle: ClientHandle, layout: Option<String>) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((config, _)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        config.keyboard_layout = layout;
+        true
     }
 
     /// get the position of the corresponding client

@@ -73,6 +73,9 @@ pub enum ProtocolError {
     /// Reassembled text did not match the announced SHA-256 digest.
     #[error("clipboard text checksum mismatch")]
     ClipboardChecksumMismatch,
+    /// Keyboard layout id is not part of this protocol version.
+    #[error("invalid keyboard layout id: `{0}`")]
+    InvalidKeyboardLayout(u8),
 }
 
 /// Application frames for clipboard synchronization. These are deliberately
@@ -822,6 +825,26 @@ pub enum Position {
     Bottom,
 }
 
+/// Layout names understood by the receiving wlroots virtual keyboard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum KeyboardLayout {
+    Spanish = 1,
+    PortugueseBrazil = 2,
+    SpanishLatinAmerica = 3,
+}
+
+impl KeyboardLayout {
+    /// Corresponding XKB layout name.
+    pub const fn xkb_name(self) -> &'static str {
+        match self {
+            Self::Spanish => "es",
+            Self::PortugueseBrazil => "br",
+            Self::SpanishLatinAmerica => "latam",
+        }
+    }
+}
+
 impl Display for Position {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let pos = match self {
@@ -861,6 +884,9 @@ pub enum ProtoEvent {
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
     Hello { commit: [u8; 8] },
+    /// Layout to use for input from this peer; `None` restores the receiver's
+    /// configured or compositor keymap.
+    KeyboardLayout(Option<KeyboardLayout>),
 }
 
 impl Display for ProtoEvent {
@@ -882,6 +908,11 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
+            ProtoEvent::KeyboardLayout(layout) => write!(
+                f,
+                "KeyboardLayout({})",
+                layout.map_or("auto", KeyboardLayout::xkb_name)
+            ),
         }
     }
 }
@@ -901,6 +932,7 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    KeyboardLayout,
 }
 
 impl ProtoEvent {
@@ -924,6 +956,7 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::KeyboardLayout(_) => EventType::KeyboardLayout,
         }
     }
 }
@@ -984,6 +1017,17 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                     *b = decode_u8(&mut buf)?;
                 }
                 Ok(Self::Hello { commit })
+            }
+            EventType::KeyboardLayout => {
+                let id = decode_u8(&mut buf)?;
+                let layout = match id {
+                    0 => None,
+                    id => Some(
+                        KeyboardLayout::try_from(id)
+                            .map_err(|_| ProtocolError::InvalidKeyboardLayout(id))?,
+                    ),
+                };
+                Ok(Self::KeyboardLayout(layout))
             }
         }
     }
@@ -1054,6 +1098,9 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         encode_u8(buf, len, *b);
                     }
                 }
+                ProtoEvent::KeyboardLayout(layout) => {
+                    encode_u8(buf, len, layout.map_or(0, |layout| layout as u8));
+                }
             }
         }
         (buf, len)
@@ -1100,6 +1147,36 @@ encode_impl!(f64);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_layout_events_round_trip() {
+        for layout in [
+            None,
+            Some(KeyboardLayout::Spanish),
+            Some(KeyboardLayout::PortugueseBrazil),
+            Some(KeyboardLayout::SpanishLatinAmerica),
+        ] {
+            let event = ProtoEvent::KeyboardLayout(layout);
+            let (encoded, len) = event.into();
+            assert!(len <= MAX_EVENT_SIZE);
+
+            match ProtoEvent::try_from(encoded).unwrap() {
+                ProtoEvent::KeyboardLayout(decoded) => assert_eq!(decoded, layout),
+                other => panic!("expected keyboard-layout event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_keyboard_layout_id_is_rejected() {
+        let mut encoded = [0; MAX_EVENT_SIZE];
+        encoded[0] = EventType::KeyboardLayout as u8;
+        encoded[1] = u8::MAX;
+        assert!(matches!(
+            ProtoEvent::try_from(encoded),
+            Err(ProtocolError::InvalidKeyboardLayout(u8::MAX))
+        ));
+    }
 
     fn offer(names: Vec<String>) -> FileOfferAnnouncement {
         FileOfferAnnouncement {

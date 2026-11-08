@@ -9,5 +9,6 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod file_transfer;
+mod keyboard_layout;
 mod listen;
 pub mod service;

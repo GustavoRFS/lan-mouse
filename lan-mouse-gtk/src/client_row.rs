@@ -91,6 +91,24 @@ impl ClientRow {
             .sync_create()
             .build();
 
+        // bind the selected XKB layout to the corresponding dropdown item
+        let keyboard_layout_binding = client_object
+            .bind_property(
+                "keyboard-layout",
+                &self.imp().keyboard_layout.get(),
+                "selected",
+            )
+            .transform_to(|_, v: String| {
+                Some(match v.as_str() {
+                    "es" => 1u32,
+                    "br" => 2u32,
+                    "latam" => 3u32,
+                    _ => 0u32,
+                })
+            })
+            .sync_create()
+            .build();
+
         // bind resolving status to spinner visibility
         let resolve_binding = client_object
             .bind_property(
@@ -121,6 +139,7 @@ impl ClientRow {
         bindings.push(port_binding);
         bindings.push(subtitle_binding);
         bindings.push(position_binding);
+        bindings.push(keyboard_layout_binding);
         bindings.push(resolve_binding);
         bindings.push(ip_binding);
 
@@ -151,6 +170,10 @@ impl ClientRow {
 
     pub fn set_position(&self, pos: Position) {
         self.imp().set_pos(pos);
+    }
+
+    pub fn set_keyboard_layout(&self, layout: Option<String>) {
+        self.imp().set_keyboard_layout(layout);
     }
 
     pub fn set_dns_state(&self, resolved: bool) {

@@ -140,6 +140,33 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// keyboard layout to use on the receiving machine (`None` means detect it).
+    pub keyboard_layout: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_config_defaults_missing_keyboard_layout_to_auto() {
+        let config: ClientConfig = serde_json::from_str(
+            r#"{"hostname":null,"fix_ips":[],"port":4242,"pos":"right","cmd":null,"leave_cmd":null}"#,
+        )
+        .unwrap();
+        assert_eq!(config.keyboard_layout, None);
+    }
+
+    #[test]
+    fn client_config_round_trips_keyboard_layout() {
+        let config = ClientConfig {
+            keyboard_layout: Some("br".into()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: ClientConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.keyboard_layout.as_deref(), Some("br"));
+    }
 }
 
 impl Default for ClientConfig {
@@ -151,6 +178,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            keyboard_layout: None,
         }
     }
 }
@@ -279,6 +307,8 @@ pub enum FrontendRequest {
     UpdatePort(ClientHandle, u16),
     /// update position
     UpdatePosition(ClientHandle, Position),
+    /// update the layout sent to this client
+    UpdateKeyboardLayout(ClientHandle, Option<String>),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// request reenabling input capture

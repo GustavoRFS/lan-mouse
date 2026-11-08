@@ -431,6 +431,8 @@ position = "right"
 hostname = "iridium"
 # activate this client immediately when lan-mouse is started
 activate_on_startup = true
+# optional per-client layout override sent to the receiver (es, br, or latam)
+# keyboard_layout = "es"
 # optional list of (known) ip addresses
 ips = ["192.168.178.156"]
 
@@ -448,27 +450,37 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
-### Keyboard layout of the receiving side (wlroots)
-Lan Mouse forwards key *positions*, so the receiving machine decides which character each
-key types. On wlroots compositors (Hyprland, Sway, ...) the virtual keyboard it creates carries
-a keymap of its own: by default a copy of the compositor's keymap taken **once, at startup**. It
-does not follow later changes to the compositor's layouts, and every modifier key (Shift, Ctrl,
-Alt, ...) switches it back to the first layout. When the sending device's keyboard has a
-different layout than this one, for instance a Spanish keyboard in front of a `br` desktop,
-`ñ` comes out as `ç` and so on, and switching layouts on the receiving desktop changes nothing.
+### Keyboard layout when sending to a wlroots computer
+Lan Mouse forwards key *positions*, so the receiving machine decides which character each key
+types. Expand a client in the GTK window and choose **keyboard layout**. The choice is saved for
+that remote computer and sent before typing begins. **Automatic (Windows)** follows the active
+input language of the app in focus on the sending computer; it recognizes Spanish (Spain), Spanish
+(Latin America), and Portuguese (Brazil). If Windows is using another layout, or the sender runs
+Linux or macOS, choose a layout manually.
 
-Set the layout of the *sending* keyboard to fix that:
+The selector offers Spanish (Spain), Portuguese (Brazil), and Spanish (Latin America). This matters
+when the source and destination layouts differ: for example, a Spanish keyboard in front of a `br`
+desktop can make `ñ` come out as `ç`. The receiver applies the selected map through its virtual
+keyboard when it uses the wlroots backend (Hyprland, Sway, and similar compositors). Other receiving
+backends continue to use the receiving operating system's active layout.
+
+Automatic detection reads the Windows input language of the focused app; it does not identify which
+physical keyboard produced a key. If two keyboards with different layouts are used at the same time,
+select the layout you want for that remote computer or switch the active Windows input language.
+
+The top-level `keyboard_layout` option remains available as a receiver-side fallback. It is useful
+for manual configuration or the `test-emulation` command:
 
 ```toml
 keyboard_layout = "es"
 # keyboard_variant = "dvorak"   # optional
 ```
 
-The names are the ones from `xkbcli list` (the `layout` and `variant` fields). The virtual keyboard
-then has only that layout, so it never changes, whatever the receiving desktop is set to.
-It applies to every connected device, as they share the one virtual keyboard. A layout
-xkb does not know is logged as an error and the compositor's keymap is used instead.
-This option is only used by the `wlroots` emulation backend.
+The names are the ones from `xkbcli list` (the `layout` and `variant` fields). The global option
+sets the receiver's initial virtual-keyboard map. A per-client layout temporarily overrides it
+while that sender controls the receiver; leaving the remote restores the initial map. A layout XKB
+does not know is logged as an error and the compositor's keymap is used instead. This option is
+only used by the `wlroots` emulation backend.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

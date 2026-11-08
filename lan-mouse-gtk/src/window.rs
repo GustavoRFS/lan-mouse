@@ -238,6 +238,23 @@ impl Window {
                             }
                         ),
                     );
+                    row.connect_closure(
+                        "request-keyboard-layout-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, layout: String| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    let layout = (!layout.is_empty()).then_some(layout);
+                                    window.request(FrontendRequest::UpdateKeyboardLayout(
+                                        client.handle(),
+                                        layout,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
                     row.upcast()
                 }
             ),
@@ -340,6 +357,7 @@ impl Window {
         row.set_hostname(client.hostname);
         row.set_port(client.port);
         row.set_position(client.pos);
+        row.set_keyboard_layout(client.keyboard_layout);
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {

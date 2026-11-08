@@ -146,6 +146,10 @@ impl LanMouseConnection {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
+    pub(crate) fn keyboard_layout(&self, handle: ClientHandle) -> Option<String> {
+        self.client_manager.get_keyboard_layout(handle)
+    }
+
     pub(crate) async fn broadcast_clipboard(
         &self,
         update_id: ClipboardUpdateId,
