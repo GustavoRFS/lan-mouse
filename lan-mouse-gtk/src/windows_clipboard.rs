@@ -168,7 +168,7 @@ fn dib_v5(texture: &gdk::Texture) -> Option<(BITMAPV5HEADER, Vec<u8>)> {
     texture.download(&mut top_down, stride);
     let mut pixels = Vec::with_capacity(size);
     for row in top_down.chunks_exact(stride).rev() {
-        for pixel in row.chunks_exact(4) {
+        for pixel in row.as_chunks::<4>().0 {
             let alpha = u32::from(pixel[3]);
             let unpremultiply = |channel: u8| match alpha {
                 0 => 0,
