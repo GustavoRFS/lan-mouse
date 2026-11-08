@@ -6,7 +6,7 @@ pub mod scancode;
 
 pub use display::{
     MAX_MONITOR_ID_BYTES, MAX_MONITOR_LABEL_BYTES, MonitorDescriptor, MonitorDescriptorError,
-    MonitorId, MonitorIdError,
+    MonitorId, MonitorIdError, MonitorLocation,
 };
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]

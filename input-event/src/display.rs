@@ -48,6 +48,15 @@ pub struct MonitorDescriptor {
     pub label: String,
     pub width: u32,
     pub height: u32,
+    /// Native desktop coordinates, present only in the local frontend catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_position: Option<MonitorLocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MonitorLocation {
+    pub x: i32,
+    pub y: i32,
 }
 
 impl MonitorDescriptor {
@@ -68,7 +77,13 @@ impl MonitorDescriptor {
             label,
             width,
             height,
+            native_position: None,
         })
+    }
+
+    pub fn with_native_position(mut self, x: i32, y: i32) -> Self {
+        self.native_position = Some(MonitorLocation { x, y });
+        self
     }
 
     pub fn validate(&self) -> Result<(), MonitorDescriptorError> {
@@ -101,10 +116,15 @@ impl<'de> Deserialize<'de> for MonitorDescriptor {
             label: String,
             width: u32,
             height: u32,
+            #[serde(default)]
+            native_position: Option<MonitorLocation>,
         }
 
         let raw = RawMonitorDescriptor::deserialize(deserializer)?;
-        Self::new(raw.id, raw.label, raw.width, raw.height).map_err(serde::de::Error::custom)
+        let mut descriptor = Self::new(raw.id, raw.label, raw.width, raw.height)
+            .map_err(serde::de::Error::custom)?;
+        descriptor.native_position = raw.native_position;
+        Ok(descriptor)
     }
 }
 

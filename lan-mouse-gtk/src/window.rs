@@ -20,6 +20,7 @@ use crate::{
     key_object::KeyObject, key_row::KeyRow,
 };
 
+use super::monitor_grid_window::{GridEditorPeer, MonitorGridWindow};
 use super::{client_object::ClientObject, client_row::ClientRow};
 
 #[cfg(target_os = "macos")]
@@ -308,6 +309,7 @@ impl Window {
         self.clients().append(&client);
         self.update_placeholder_visibility();
         self.update_dns_state(handle, !state.ips.is_empty());
+        self.sync_grid_editor_peers();
     }
 
     pub(super) fn update_client_list(
@@ -347,6 +349,7 @@ impl Window {
         if self.clients().n_items() == 0 {
             self.update_placeholder_visibility();
         }
+        self.sync_grid_editor_peers();
     }
 
     pub(super) fn update_client_config(&self, handle: ClientHandle, client: ClientConfig) {
@@ -358,6 +361,7 @@ impl Window {
         row.set_port(client.port);
         row.set_position(client.pos);
         row.set_keyboard_layout(client.keyboard_layout);
+        self.sync_grid_editor_peers();
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
@@ -389,7 +393,18 @@ impl Window {
             "peer-commit",
             crate::client_object::peer_commit_to_string(state.peer_commit),
         );
+        if let Some(fingerprint) = state.peer_fingerprint {
+            let previous: Option<String> = client_object.property("peer-fingerprint");
+            if previous.as_ref() != Some(&fingerprint) {
+                client_object.set_property("monitor-grid-version", 0_u32);
+            }
+            client_object.set_property("peer-fingerprint", fingerprint);
+        }
+        if let Some(version) = state.monitor_grid_version {
+            client_object.set_property("monitor-grid-version", u32::from(version));
+        }
         row.refresh_version_status();
+        self.sync_grid_editor_peers();
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {
@@ -485,6 +500,88 @@ impl Window {
         if let Err(e) = requester.request(request) {
             log::error!("error sending message: {e}");
         };
+    }
+
+    fn setup_monitor_grid_action(&self) {
+        let action = gio::SimpleAction::new("arrange-monitors", None);
+        let window = self.downgrade();
+        action.connect_activate(move |_, _| {
+            if let Some(window) = window.upgrade() {
+                window.open_monitor_grid_window();
+            }
+        });
+        self.add_action(&action);
+    }
+
+    fn open_monitor_grid_window(&self) {
+        if let Some(editor) = self.imp().monitor_grid_window.borrow().as_ref() {
+            editor.present();
+            self.request(FrontendRequest::Sync);
+            return;
+        }
+
+        let parent = self.downgrade();
+        let editor = MonitorGridWindow::new(self, move |request| {
+            if let Some(parent) = parent.upgrade() {
+                parent.request(request);
+            }
+        });
+        editor.set_peers(self.grid_editor_peers());
+        editor.present();
+        self.imp().monitor_grid_window.replace(Some(editor));
+        self.request(FrontendRequest::Sync);
+    }
+
+    fn grid_editor_peers(&self) -> Vec<GridEditorPeer> {
+        self.clients()
+            .iter::<ClientObject>()
+            .filter_map(Result::ok)
+            .map(|client| {
+                let data = client.get_data();
+                GridEditorPeer {
+                    handle: data.handle,
+                    name: data
+                        .hostname
+                        .unwrap_or_else(|| format!("Peer {}", data.handle)),
+                    fingerprint: data.peer_fingerprint,
+                    supports_monitor_grid: data.monitor_grid_version >= 1,
+                }
+            })
+            .collect()
+    }
+
+    fn sync_grid_editor_peers(&self) {
+        if let Some(editor) = self.imp().monitor_grid_window.borrow().as_ref() {
+            editor.set_peers(self.grid_editor_peers());
+        }
+    }
+
+    pub(super) fn update_monitor_grid(&self, grid: lan_mouse_ipc::MonitorGrid) {
+        if let Some(editor) = self.imp().monitor_grid_window.borrow().as_ref() {
+            editor.set_grid(grid);
+        }
+    }
+
+    pub(super) fn set_local_monitor_catalog(&self, monitors: Vec<input_event::MonitorDescriptor>) {
+        if let Some(editor) = self.imp().monitor_grid_window.borrow().as_ref() {
+            editor.set_local_catalog(monitors);
+        }
+    }
+
+    pub(super) fn set_remote_monitor_catalog(
+        &self,
+        owner_fingerprint: String,
+        monitors: Vec<input_event::MonitorDescriptor>,
+    ) {
+        if let Some(editor) = self.imp().monitor_grid_window.borrow().as_ref() {
+            editor.set_remote_catalog(owner_fingerprint, monitors);
+        }
+    }
+
+    pub(super) fn set_local_fingerprint(&self, fingerprint: String) {
+        if let Some(editor) = self.imp().monitor_grid_window.borrow().as_ref() {
+            editor.set_local_owner(fingerprint);
+        }
     }
 
     pub(super) fn show_toast(&self, msg: &str) {

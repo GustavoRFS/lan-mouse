@@ -22,6 +22,7 @@ impl OutputGeometry {
             u32::try_from(self.height).ok()?,
         )
         .ok()
+        .map(|descriptor| descriptor.with_native_position(self.x, self.y))
     }
 
     #[cfg(any(windows, test))]

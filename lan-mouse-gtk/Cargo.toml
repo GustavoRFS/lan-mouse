@@ -16,6 +16,7 @@ base64 = "0.22.1"
 sha2 = "0.10.8"
 tempfile = "3.10.1"
 lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.5.0" }
+input-event = { path = "../input-event", version = "0.4.0" }
 lan-mouse-proto = { path = "../lan-mouse-proto", version = "0.5.0" }
 lan-mouse-transfer = { path = "../lan-mouse-transfer", version = "0.1.0" }
 thiserror = "2.0.0"

@@ -1628,6 +1628,7 @@ mod monitor_grid_protocol_tests {
             label: "LG UltraFine".into(),
             width: 3840,
             height: 2160,
+            native_position: None,
         };
         let (bytes, _) = encode(ProtoEvent::MonitorCatalogChunk {
             transfer_id: 42,

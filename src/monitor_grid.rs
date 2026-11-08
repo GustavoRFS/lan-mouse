@@ -18,6 +18,40 @@ mod tests {
     }
 
     #[test]
+    fn local_grid_entries_preserve_native_monitor_arrangement() {
+        let monitors = vec![
+            MonitorDescriptor::new(id("DISPLAY1"), "Primary".into(), 1920, 1080)
+                .unwrap()
+                .with_native_position(0, 0),
+            MonitorDescriptor::new(id("DISPLAY2"), "Portrait".into(), 1080, 1920)
+                .unwrap()
+                .with_native_position(1920, -400),
+            MonitorDescriptor::new(id("DISPLAY3"), "Lower".into(), 1920, 1080)
+                .unwrap()
+                .with_native_position(0, 1080),
+        ];
+        let entries = local_grid_entries("local", &monitors);
+        let positions = entries
+            .iter()
+            .map(|entry| (entry.monitor_id.as_str(), entry.position))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(positions["DISPLAY1"], GridPosition { x: 0, y: 1 });
+        assert_eq!(positions["DISPLAY2"], GridPosition { x: 1, y: 0 });
+        assert_eq!(positions["DISPLAY3"], GridPosition { x: 0, y: 2 });
+    }
+
+    #[test]
+    fn empty_remote_catalog_completes_discovery() {
+        let mut reassembler = MonitorCatalogReassembler::default();
+        let chunks = catalog_chunks(8, &[]);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            reassembler.push(chunks[0].clone()).unwrap(),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
     fn route_uses_exact_source_monitor_and_edge() {
         let local = entry("local", "left-monitor", 0, 0);
         let grid = MonitorGrid::new(
@@ -126,9 +160,9 @@ mod tests {
     }
 }
 use input_event::{MonitorDescriptor, MonitorId};
-use lan_mouse_ipc::{MonitorGrid, MonitorGridEntry, Position};
+use lan_mouse_ipc::{GridPosition, MonitorGrid, MonitorGridEntry, Position};
 use lan_mouse_proto::ProtoEvent;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 const MAX_SNAPSHOT_CHUNKS: usize = 256;
@@ -136,6 +170,64 @@ const MAX_SNAPSHOT_BYTES: usize =
     MAX_SNAPSHOT_CHUNKS * lan_mouse_proto::MAX_MONITOR_GRID_CHUNK_PAYLOAD;
 const MAX_PARTIAL_SNAPSHOTS: usize = 4;
 const MAX_CATALOG_CHUNKS: usize = 52;
+
+pub fn local_grid_entries(
+    owner_fingerprint: &str,
+    monitors: &[MonitorDescriptor],
+) -> Vec<MonitorGridEntry> {
+    let x_positions = monitors
+        .iter()
+        .filter_map(|monitor| monitor.native_position.map(|position| position.x))
+        .collect::<BTreeSet<_>>();
+    let y_positions = monitors
+        .iter()
+        .filter_map(|monitor| monitor.native_position.map(|position| position.y))
+        .collect::<BTreeSet<_>>();
+    let x_indexes = x_positions
+        .into_iter()
+        .enumerate()
+        .map(|(index, x)| (x, index as i32))
+        .collect::<HashMap<_, _>>();
+    let y_indexes = y_positions
+        .into_iter()
+        .enumerate()
+        .map(|(index, y)| (y, index as i32))
+        .collect::<HashMap<_, _>>();
+    let mut sorted = monitors.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+
+    let mut entries = Vec::with_capacity(sorted.len());
+    for monitor in sorted {
+        let native = monitor.native_position;
+        let mut position = match native {
+            Some(native) => GridPosition {
+                x: x_indexes[&native.x],
+                y: y_indexes[&native.y],
+            },
+            None => GridPosition {
+                x: entries
+                    .iter()
+                    .map(|entry: &MonitorGridEntry| entry.position.x)
+                    .max()
+                    .unwrap_or(-1)
+                    .saturating_add(1),
+                y: 0,
+            },
+        };
+        while entries
+            .iter()
+            .any(|entry: &MonitorGridEntry| entry.position == position)
+        {
+            position.x = position.x.saturating_add(1);
+        }
+        entries.push(MonitorGridEntry {
+            owner_fingerprint: owner_fingerprint.to_owned(),
+            monitor_id: monitor.id.clone(),
+            position,
+        });
+    }
+    entries
+}
 
 pub fn route(
     grid: &MonitorGrid,
@@ -180,7 +272,12 @@ pub fn enter_event(
 
 pub fn catalog_chunks(transfer_id: u32, monitors: &[MonitorDescriptor]) -> Vec<ProtoEvent> {
     if monitors.is_empty() {
-        return Vec::new();
+        return vec![ProtoEvent::MonitorCatalogChunk {
+            transfer_id,
+            index: 0,
+            count: 1,
+            descriptors: Vec::new(),
+        }];
     }
     let count = monitors
         .len()

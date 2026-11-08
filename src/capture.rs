@@ -418,8 +418,18 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let mut last_monitor_catalog = capture.monitor_catalog();
+        let mut monitor_catalog_refresh = tokio::time::interval(std::time::Duration::from_secs(2));
+        monitor_catalog_refresh.tick().await;
         loop {
             tokio::select! {
+                _ = monitor_catalog_refresh.tick() => {
+                    let catalog = capture.monitor_catalog();
+                    if catalog != last_monitor_catalog {
+                        last_monitor_catalog = catalog.clone();
+                        self.event_tx.send(ICaptureEvent::LocalMonitorCatalog(catalog)).expect("channel closed");
+                    }
+                },
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),

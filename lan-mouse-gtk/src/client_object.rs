@@ -31,6 +31,11 @@ impl ClientObject {
             )
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
+            .property("peer-fingerprint", state.peer_fingerprint)
+            .property(
+                "monitor-grid-version",
+                state.monitor_grid_version.map_or(0, u32::from),
+            )
             .build()
     }
 
@@ -57,5 +62,7 @@ pub struct ClientData {
     pub resolving: bool,
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
+    pub peer_fingerprint: Option<String>,
+    pub monitor_grid_version: u32,
     pub keyboard_layout: String,
 }

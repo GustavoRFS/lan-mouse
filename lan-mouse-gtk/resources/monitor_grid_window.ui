@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.0"/>
+  <object class="AdwWindow" id="monitor_grid_window">
+    <property name="title" translatable="yes">Arrange monitors</property>
+    <property name="default-width">760</property>
+    <property name="default-height">560</property>
+    <property name="content">
+      <object class="GtkBox">
+        <property name="orientation">vertical</property>
+        <child>
+          <object class="AdwHeaderBar">
+            <property name="title-widget">
+              <object class="GtkLabel">
+                <property name="label" translatable="yes">Monitor layout</property>
+                <style><class name="title"/></style>
+              </object>
+            </property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <property name="margin-start">18</property>
+            <property name="margin-end">18</property>
+            <property name="margin-top">12</property>
+            <property name="margin-bottom">8</property>
+            <child>
+              <object class="GtkDropDown" id="peer_selector">
+                <property name="hexpand">True</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkButton" id="discover_button">
+                <property name="label" translatable="yes">Discover displays</property>
+                <property name="sensitive">False</property>
+                <style><class name="suggested-action"/></style>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkLabel" id="status_label">
+            <property name="label" translatable="yes">Waiting for display information…</property>
+            <property name="xalign">0</property>
+            <property name="margin-start">20</property>
+            <property name="margin-end">20</property>
+            <property name="margin-bottom">10</property>
+            <style><class name="dim-label"/></style>
+          </object>
+        </child>
+        <child>
+          <object class="GtkScrolledWindow">
+            <property name="hexpand">True</property>
+            <property name="vexpand">True</property>
+            <property name="has-frame">True</property>
+            <property name="margin-start">16</property>
+            <property name="margin-end">16</property>
+            <property name="margin-bottom">16</property>
+            <property name="child">
+              <object class="GtkGrid" id="monitor_grid">
+                <property name="row-spacing">12</property>
+                <property name="column-spacing">12</property>
+                <property name="halign">center</property>
+                <property name="valign">center</property>
+                <property name="margin">18</property>
+              </object>
+            </property>
+          </object>
+        </child>
+      </object>
+    </property>
+  </object>
+</interface>

@@ -11,7 +11,7 @@ use crate::{
     listen::{LanMouseListener, ListenerCreationError},
     monitor_grid::{
         GridSnapshotReassembler, GridSnapshotSender, GridSnapshotUpdate, MonitorCatalogReassembler,
-        catalog_chunks,
+        catalog_chunks, local_grid_entries,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -92,6 +92,7 @@ pub struct Service {
     monitor_grid: Option<MonitorGrid>,
     local_monitor_catalog: Vec<MonitorDescriptor>,
     remote_monitor_catalogs: HashMap<String, Vec<MonitorDescriptor>>,
+    client_peer_fingerprints: HashMap<ClientHandle, String>,
     catalog_reassemblers: HashMap<String, MonitorCatalogReassembler>,
     grid_reassembler: GridSnapshotReassembler,
     grid_senders: HashMap<ClientHandle, GridSnapshotSender>,
@@ -177,6 +178,7 @@ impl Service {
             monitor_grid,
             local_monitor_catalog: Vec::new(),
             remote_monitor_catalogs: HashMap::new(),
+            client_peer_fingerprints: HashMap::new(),
             catalog_reassemblers: HashMap::new(),
             grid_reassembler: GridSnapshotReassembler::default(),
             grid_senders: HashMap::new(),
@@ -879,9 +881,18 @@ impl Service {
             ICaptureEvent::LocalMonitorCatalog(monitors) => {
                 self.local_monitor_catalog = monitors.clone();
                 self.notify_frontend(FrontendEvent::LocalMonitorCatalog(monitors));
+                self.update_local_monitor_grid();
+                self.broadcast_local_monitor_catalog();
                 self.rebuild_active_client_captures();
             }
             ICaptureEvent::PeerConnected(handle) => {
+                if let Some(fingerprint) = self
+                    .client_manager
+                    .get_state(handle)
+                    .and_then(|(_, state)| state.peer_fingerprint)
+                {
+                    self.client_peer_fingerprints.insert(handle, fingerprint);
+                }
                 if self.client_manager.supports_monitor_grid(handle) {
                     self.send_grid_snapshot(handle);
                     self.send_local_catalog(handle);
@@ -889,6 +900,7 @@ impl Service {
             }
             ICaptureEvent::PeerDisconnected(handle) => {
                 self.grid_senders.remove(&handle);
+                self.clear_disconnected_remote_catalog(handle);
                 self.rebuild_active_client_captures();
                 self.broadcast_client(handle);
             }
@@ -899,6 +911,101 @@ impl Service {
             ICaptureEvent::PeerProtocol { handle, event } => {
                 self.handle_peer_protocol(handle, event);
             }
+        }
+    }
+
+    fn update_local_monitor_grid(&mut self) {
+        if self.local_monitor_catalog.is_empty() {
+            return;
+        }
+        let native_entries =
+            local_grid_entries(&self.public_key_fingerprint, &self.local_monitor_catalog);
+        let Some(current) = self.monitor_grid.as_ref() else {
+            if let Ok(grid) =
+                MonitorGrid::new(1, self.public_key_fingerprint.clone(), native_entries)
+            {
+                self.apply_monitor_grid(grid, None);
+            }
+            return;
+        };
+
+        let mut entries = current.entries.clone();
+        let mut changed = false;
+        for mut candidate in native_entries {
+            if entries.iter().any(|entry| {
+                entry.owner_fingerprint == self.public_key_fingerprint
+                    && entry.monitor_id == candidate.monitor_id
+            }) {
+                continue;
+            }
+            while entries
+                .iter()
+                .any(|entry| entry.position == candidate.position)
+            {
+                candidate.position.x = candidate.position.x.saturating_add(1);
+            }
+            entries.push(candidate);
+            changed = true;
+        }
+        if changed {
+            let revision = current.revision.saturating_add(1);
+            if let Ok(grid) =
+                MonitorGrid::new(revision, self.public_key_fingerprint.clone(), entries)
+            {
+                self.apply_monitor_grid(grid, None);
+            }
+        }
+    }
+
+    fn broadcast_local_monitor_catalog(&self) {
+        let handles = self
+            .client_manager
+            .registered_clients()
+            .into_iter()
+            .filter(|handle| {
+                self.client_manager.supports_monitor_grid(*handle)
+                    && self
+                        .client_manager
+                        .get_state(*handle)
+                        .is_some_and(|(_, state)| state.active_addr.is_some())
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            self.send_local_catalog(handle);
+        }
+        let incoming = self
+            .incoming_fingerprints
+            .iter()
+            .filter(|(_, fingerprint)| {
+                self.peer_capabilities
+                    .get(fingerprint.as_str())
+                    .is_some_and(|version| *version >= 1)
+            })
+            .map(|(addr, _)| *addr)
+            .collect::<Vec<_>>();
+        for addr in incoming {
+            self.send_local_catalog_to_addr(addr);
+        }
+    }
+
+    fn clear_disconnected_remote_catalog(&mut self, handle: ClientHandle) {
+        let Some(fingerprint) = self.client_peer_fingerprints.remove(&handle) else {
+            return;
+        };
+        let still_connected = self.client_peer_fingerprints.iter().any(|(other, owner)| {
+            owner == &fingerprint
+                && self
+                    .client_manager
+                    .get_state(*other)
+                    .is_some_and(|(_, state)| state.active_addr.is_some())
+        });
+        if !still_connected {
+            self.remote_monitor_catalogs.remove(&fingerprint);
+            self.catalog_reassemblers.remove(&fingerprint);
+            self.notify_frontend(FrontendEvent::RemoteMonitorCatalog {
+                owner_fingerprint: fingerprint,
+                monitors: Vec::new(),
+            });
         }
     }
 

@@ -9,6 +9,7 @@ use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, gdk, 
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
 use crate::authorization_window::AuthorizationWindow;
+use crate::monitor_grid_window::MonitorGridWindow;
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/de/feschber/LanMouse/window.ui")]
@@ -55,6 +56,7 @@ pub struct Window {
     pub emulation_active: Cell<bool>,
     pub clipboard_sharing: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    pub(super) monitor_grid_window: RefCell<Option<MonitorGridWindow>>,
 }
 
 #[glib::object_subclass]
@@ -221,6 +223,7 @@ impl ObjectImpl for Window {
                 }
             });
         obj.setup_icon();
+        obj.setup_monitor_grid_action();
         obj.setup_clients();
         obj.setup_authorized();
     }

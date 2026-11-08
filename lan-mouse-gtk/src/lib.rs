@@ -13,6 +13,7 @@ mod linux_tray;
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+mod monitor_grid_window;
 mod notify;
 mod window;
 #[cfg(windows)]
@@ -322,7 +323,10 @@ fn build_ui(app: &Application) {
                     FrontendEvent::CaptureStatus(s) => window.set_capture(s.into()),
                     FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
                     FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
-                    FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
+                    FrontendEvent::PublicKeyFingerprint(fp) => {
+                        window.set_pk_fp(&fp);
+                        window.set_local_fingerprint(fp);
+                    }
                     FrontendEvent::ConnectionAttempt { fingerprint } => {
                         window.request_authorization(&fingerprint);
                     }
@@ -357,6 +361,18 @@ fn build_ui(app: &Application) {
                     }
                     FrontendEvent::ClipboardFileOffer { update_id, offer } => {
                         clipboard_sync.apply_remote_file_offer(update_id, offer);
+                    }
+                    FrontendEvent::MonitorGridUpdated(grid) => {
+                        window.update_monitor_grid(grid);
+                    }
+                    FrontendEvent::LocalMonitorCatalog(monitors) => {
+                        window.set_local_monitor_catalog(monitors);
+                    }
+                    FrontendEvent::RemoteMonitorCatalog {
+                        owner_fingerprint,
+                        monitors,
+                    } => {
+                        window.set_remote_monitor_catalog(owner_fingerprint, monitors);
                     }
                 }
             }

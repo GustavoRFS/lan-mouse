@@ -1835,6 +1835,7 @@ dependencies = [
  "glib-build-tools",
  "gtk4",
  "hostname",
+ "input-event",
  "ksni",
  "lan-mouse-ipc",
  "lan-mouse-proto",
