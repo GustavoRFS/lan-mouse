@@ -33,6 +33,12 @@ There are currently no mitigations in place for timing side-channel attacks.
 
 Clipboard sharing is enabled by default and can be paused in the app. Text (up to 256 KiB) and native clipboard images (encoded PNG, up to 8 MiB) are sent to every connected, authenticated peer that supports the corresponding format. An image copied directly from a drawing app or browser is an image clipboard item; an image file copied in Explorer or Files is a file clipboard item. Copied files and folders have no size limit and are transferred only when pasted, over TLS on TCP using the Lan Mouse port (4242 by default), so the firewall of every device has to allow TCP on that port as well. On Windows they paste in Explorer, which shows its own progress; apps that only accept file paths, such as browsers, cannot paste them. On Linux the paste waits until the files are downloaded. On wlroots Wayland desktops, hidden-window clipboard monitoring requires `wl-clipboard` (`wl-paste`).
 
+## Audio sharing
+
+The client list includes per-peer audio modes: **Off**, **Send**, and **Receive**. Audio starts only when both authenticated peers choose complementary modes. Sending can include the selected system output and/or microphone; receiving plays system audio to the selected output and can expose the remote microphone as a local recording source. Audio uses 48 kHz Opus frames over the authenticated DTLS connection. Windows and Linux peers can send and receive system audio; microphone capture is also supported on both platforms. Receiving remote microphone audio as a recording device on Windows is pending the virtual microphone driver.
+
+Linux uses a PulseAudio-compatible server, including PipeWire's PulseAudio service, and requires `pactl` plus the PulseAudio development library to build. Windows uses WASAPI for device capture and playback. Its remote microphone recording endpoint still requires a separate WDM/WaveRT driver package; that driver is not included yet, so Windows reports the microphone device as unavailable until the driver is implemented and installed. Other operating systems do not currently provide audio support. Older Lan Mouse peers continue to share input and clipboard data, but do not negotiate audio.
+
 ## OS Support
 
 Most current desktop environments and operating systems are fully supported, this includes
