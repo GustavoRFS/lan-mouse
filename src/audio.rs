@@ -261,13 +261,17 @@ impl AudioRuntime {
 
 fn spawn_capture(
     handle: ClientHandle,
-    mut capture: AudioCapture,
+    capture: AudioCapture,
     sender: &AudioSender,
 ) -> ActiveCapture {
     let cancellation = CancellationToken::new();
     let child = cancellation.clone();
     let sender = sender.clone();
+    // Dropping this sender stops the backend worker, so retain it for the task's lifetime.
+    let stop = capture.stop;
+    let mut frames = capture.frames;
     let task = spawn_local(async move {
+        let _stop = stop;
         let mut encoder = match AudioEncoder::new() {
             Ok(encoder) => encoder,
             Err(error) => {
@@ -278,17 +282,66 @@ fn spawn_capture(
         loop {
             tokio::select! {
                 _ = child.cancelled() => break,
-                frame = capture.frames.recv() => match frame {
+                frame = frames.recv() => match frame {
                     Some(frame) => match encoder.encode(&frame) {
-                        Ok(data) => sender.send(handle, AudioMessage::Data(data)),
-                        Err(error) => log::debug!("cannot encode audio for peer {handle}: {error}"),
-                    },
+                            Ok(data) => sender.send(handle, AudioMessage::Data(data)),
+                            Err(error) => log::debug!("cannot encode audio for peer {handle}: {error}"),
+                        },
                     None => break,
                 }
             }
         }
     });
     ActiveCapture { cancellation, task }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        sync::{mpsc, oneshot},
+        task::LocalSet,
+    };
+
+    #[test]
+    fn capture_worker_stays_alive_while_audio_frames_are_consumed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(LocalSet::new().run_until(async {
+            let (frames_tx, frames_rx) = mpsc::channel(1);
+            let (stop_tx, mut stop_rx) = oneshot::channel();
+            let capture = AudioCapture {
+                frames: frames_rx,
+                stop: stop_tx,
+            };
+            let channel = crate::capture::test_utils::audio_channel();
+            let mut active = spawn_capture(7, capture, channel.sender());
+
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                stop_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+
+            frames_tx
+                .send(lan_mouse_audio::PcmFrame {
+                    track: AudioTrack::Microphone,
+                    sequence: 0,
+                    timestamp_48khz: 0,
+                    channels: 1,
+                    samples: vec![0; lan_mouse_audio::SAMPLES_PER_FRAME],
+                })
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+
+            active.cancellation.cancel();
+            (&mut active.task).await.unwrap();
+        }));
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]

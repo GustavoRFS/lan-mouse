@@ -36,6 +36,30 @@ impl AudioSender {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use super::*;
+
+    pub(crate) struct AudioChannel {
+        sender: AudioSender,
+        _receiver: Receiver<CaptureRequest>,
+    }
+
+    impl AudioChannel {
+        pub(crate) fn sender(&self) -> &AudioSender {
+            &self.sender
+        }
+    }
+
+    pub(crate) fn audio_channel() -> AudioChannel {
+        let (sender, receiver) = channel();
+        AudioChannel {
+            sender: AudioSender(sender),
+            _receiver: receiver,
+        }
+    }
+}
+
 pub(crate) enum ICaptureEvent {
     /// a client was entered
     CaptureBegin(CaptureHandle),

@@ -5,8 +5,8 @@ use crate::{
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
-    AudioMessage, ClipboardFrame, ClipboardUpdateId, MAX_AUDIO_DATAGRAM_SIZE, MAX_EVENT_SIZE,
-    ProtoEvent, decode_audio_message, is_audio_message,
+    AudioControl, AudioMessage, ClipboardFrame, ClipboardUpdateId, MAX_AUDIO_DATAGRAM_SIZE,
+    MAX_EVENT_SIZE, ProtoEvent, decode_audio_message, is_audio_message,
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -122,6 +122,7 @@ pub(crate) struct LanMouseConnection {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, ClientConnection>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    pending_audio_controls: Rc<RefCell<HashMap<ClientHandle, AudioControl>>>,
     recv_rx: Receiver<(ClientHandle, NetworkEvent)>,
     recv_tx: Sender<(ClientHandle, NetworkEvent)>,
     audio_rx: tokio::sync::mpsc::Receiver<(ClientHandle, AudioMessage)>,
@@ -143,6 +144,7 @@ impl LanMouseConnection {
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
+            pending_audio_controls: Default::default(),
             recv_rx,
             recv_tx,
             audio_rx,
@@ -244,6 +246,7 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.audio_tx.clone(),
+                self.pending_audio_controls.clone(),
                 self.ping_response.clone(),
                 self.reassembler.clone(),
             ));
@@ -256,6 +259,11 @@ impl LanMouseConnection {
         message: AudioMessage,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
+        let pending_control = match &message {
+            AudioMessage::Control(control) => Some(control.clone()),
+            AudioMessage::Data(_) => None,
+        };
+        let is_control = pending_control.is_some();
         let bytes = lan_mouse_proto::encode_audio_message(&message)?;
         if let Some(addr) = self.client_manager.active_addr(handle) {
             let connection = {
@@ -264,6 +272,11 @@ impl LanMouseConnection {
             };
             if let Some(connection) = connection {
                 if let Err(error) = connection.conn.send(&bytes).await {
+                    if let Some(control) = &pending_control {
+                        self.pending_audio_controls
+                            .borrow_mut()
+                            .insert(handle, control.clone());
+                    }
                     log::warn!("client {handle} failed to send audio: {error}");
                     disconnect(
                         &self.client_manager,
@@ -275,9 +288,21 @@ impl LanMouseConnection {
                     .await;
                     return Err(error.into());
                 }
+                if let Some(control) = &pending_control {
+                    let mut pending = self.pending_audio_controls.borrow_mut();
+                    if pending.get(&handle) == Some(control) {
+                        pending.remove(&handle);
+                    }
+                }
                 log::trace!("audio frame sent to {addr}");
                 return Ok(());
             }
+        }
+
+        if let Some(control) = &pending_control {
+            self.pending_audio_controls
+                .borrow_mut()
+                .insert(handle, control.clone());
         }
 
         let mut connecting = self.connecting.lock().await;
@@ -291,9 +316,14 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.audio_tx.clone(),
+                self.pending_audio_controls.clone(),
                 self.ping_response.clone(),
                 self.reassembler.clone(),
             ));
+        }
+        if is_control {
+            log::debug!("queued audio control for client {handle} until connected");
+            return Ok(());
         }
         Err(LanMouseConnectionError::NotConnected)
     }
@@ -308,6 +338,7 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, NetworkEvent)>,
     audio_tx: tokio::sync::mpsc::Sender<(ClientHandle, AudioMessage)>,
+    pending_audio_controls: Rc<RefCell<HashMap<ClientHandle, AudioControl>>>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     reassembler: SharedClipboardReassembler,
 ) -> Result<(), LanMouseConnectionError> {
@@ -339,6 +370,18 @@ async fn connect_to_handle(
                 clipboard: clipboard.clone(),
             },
         );
+        let pending_control = pending_audio_controls.borrow_mut().remove(&handle);
+        if let Some(control) = pending_control {
+            let bytes =
+                lan_mouse_proto::encode_audio_message(&AudioMessage::Control(control.clone()))?;
+            if let Err(error) = conn.send(&bytes).await {
+                let mut pending = pending_audio_controls.borrow_mut();
+                pending.entry(handle).or_insert(control);
+                log::warn!("client {handle} failed to send queued audio control: {error}");
+            } else {
+                log::debug!("sent queued audio control to client {handle}");
+            }
+        }
         connecting.lock().await.remove(&handle);
 
         // Best-effort version handshake. Send our commit hash once
@@ -477,6 +520,45 @@ async fn receive_loop(
     }
     log::warn!("recv error");
     disconnect(&client_manager, handle, addr, &conns, &tx).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lan_mouse_proto::{AudioControl, AudioRole};
+    use tokio::task::LocalSet;
+
+    #[test]
+    fn disconnected_audio_control_is_accepted_for_retry() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let cert = Certificate::generate_self_signed(["audio-test".to_owned()]).unwrap();
+        let reassembler = Arc::new(Mutex::new(lan_mouse_proto::ClipboardReassembler::default()));
+        let connection = LanMouseConnection::new(cert, client_manager, reassembler);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = AudioControl {
+            role: AudioRole::Receive,
+            send_system_audio: false,
+            send_microphone: false,
+            receive_microphone: true,
+        };
+        let expected = control.clone();
+
+        let result = runtime.block_on(LocalSet::new().run_until(async {
+            connection
+                .send_audio(AudioMessage::Control(control), handle)
+                .await
+        }));
+
+        assert!(result.is_ok(), "disconnected control should be queued");
+        assert_eq!(
+            connection.pending_audio_controls.borrow().get(&handle),
+            Some(&expected)
+        );
+    }
 }
 
 async fn disconnect(
