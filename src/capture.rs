@@ -9,7 +9,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::{ClipboardUpdateId, ProtoEvent};
+use lan_mouse_proto::{AudioMessage, ClipboardUpdateId, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,7 @@ pub(crate) struct Capture {
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
+    audio_event_rx: tokio::sync::mpsc::Receiver<ICaptureEvent>,
 }
 
 pub(crate) enum ICaptureEvent {
@@ -48,6 +49,13 @@ pub(crate) enum ICaptureEvent {
     Clipboard {
         update_id: ClipboardUpdateId,
         payload: ClipboardPayload,
+    },
+    Audio {
+        handle: u64,
+        message: AudioMessage,
+    },
+    PeerDisconnected {
+        handle: u64,
     },
 }
 
@@ -88,6 +96,7 @@ impl Capture {
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (audio_event_tx, audio_event_rx) = tokio::sync::mpsc::channel(4);
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
@@ -97,6 +106,7 @@ impl Capture {
             conn,
             event_tx,
             request_rx,
+            audio_event_tx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
         };
@@ -106,6 +116,7 @@ impl Capture {
             request_tx,
             task,
             event_rx,
+            audio_event_rx,
         }
     }
 
@@ -148,7 +159,10 @@ impl Capture {
     }
 
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
-        self.event_rx.recv().await.expect("channel closed")
+        tokio::select! {
+            event = self.event_rx.recv() => event.expect("channel closed"),
+            event = self.audio_event_rx.recv() => event.expect("audio event channel closed"),
+        }
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
@@ -198,6 +212,7 @@ struct CaptureTask {
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
+    audio_event_tx: tokio::sync::mpsc::Sender<ICaptureEvent>,
     state: State,
 }
 
@@ -255,10 +270,21 @@ impl CaptureTask {
                         }
                     },
                     (handle, event) = self.conn.recv() => {
-                        if let NetworkEvent::Clipboard { update_id, payload } = event {
-                            self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
-                        } else {
-                            log::trace!("ignoring non-clipboard network event from {handle} while input capture is unavailable");
+                        match event {
+                            NetworkEvent::Clipboard { update_id, payload } => {
+                                self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
+                            }
+                            NetworkEvent::Audio(message) => {
+                                if let Err(error) = self.audio_event_tx.try_send(ICaptureEvent::Audio { handle, message }) {
+                                    log::debug!("dropping audio event from client {handle}: {error}");
+                                }
+                            }
+                            NetworkEvent::Disconnected => {
+                                self.event_tx.send(ICaptureEvent::PeerDisconnected { handle }).expect("channel closed");
+                            }
+                            NetworkEvent::Proto(_) => {
+                                log::trace!("ignoring input network event from {handle} while input capture is unavailable");
+                            }
                         }
                     }
                     _ = self.cancellation_token.cancelled() => return,
@@ -320,6 +346,19 @@ impl CaptureTask {
                     let event = match event {
                         NetworkEvent::Clipboard { update_id, payload } => {
                             self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::Audio(message) => {
+                            if let Err(error) = self.audio_event_tx.try_send(ICaptureEvent::Audio { handle, message }) {
+                                log::debug!("dropping audio event from client {handle}: {error}");
+                            }
+                            continue;
+                        }
+                        NetworkEvent::Disconnected => {
+                            self.event_tx.send(ICaptureEvent::PeerDisconnected { handle }).expect("channel closed");
+                            if self.active_client == Some(handle) {
+                                self.release_capture(capture).await?;
+                            }
                             continue;
                         }
                         NetworkEvent::Proto(event) => event,

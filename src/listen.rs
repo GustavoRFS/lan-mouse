@@ -1,6 +1,7 @@
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::{
-    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
+    AudioMessage, ClipboardFrame, ClipboardUpdateId, MAX_AUDIO_DATAGRAM_SIZE, MAX_EVENT_SIZE,
+    ProtoEvent, decode_audio_message, is_audio_message,
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
@@ -49,6 +50,13 @@ pub(crate) enum ListenEvent {
         payload: ClipboardPayload,
         addr: SocketAddr,
     },
+    Audio {
+        addr: SocketAddr,
+        message: AudioMessage,
+    },
+    Disconnected {
+        addr: SocketAddr,
+    },
     Accept {
         addr: SocketAddr,
         fingerprint: String,
@@ -61,6 +69,8 @@ pub(crate) enum ListenEvent {
 pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
+    audio_rx: tokio::sync::mpsc::Receiver<(SocketAddr, AudioMessage)>,
+    prefer_audio: bool,
     listen_task: JoinHandle<()>,
     conns: Rc<AsyncMutex<Vec<IncomingConnection>>>,
     request_port_change: Sender<u16>,
@@ -88,6 +98,8 @@ impl LanMouseListener {
         reassembler: SharedClipboardReassembler,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(4);
+        let listen_audio_tx = audio_tx.clone();
         let (request_port_change, mut request_port_change_rx) = channel();
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
@@ -135,6 +147,7 @@ impl LanMouseListener {
         let conns_clone = conns.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
+            let audio_tx = listen_audio_tx.clone();
             let connection_attempts = connection_attempts.clone();
             let reassembler = reassembler.clone();
             spawn_local(async move {
@@ -158,7 +171,7 @@ impl LanMouseListener {
                                 let cert = certs.first().expect("cert");
                                 let fingerprint = crypto::generate_fingerprint(cert);
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, clipboard, listen_tx.clone()));
+                                spawn_local(read_loop(conns_clone.clone(), addr, conn, clipboard, listen_tx.clone(), audio_tx.clone()));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -203,6 +216,8 @@ impl LanMouseListener {
             conns,
             listen_rx,
             listen_tx,
+            audio_rx,
+            prefer_audio: true,
             listen_task,
             port_changed,
             request_port_change,
@@ -295,7 +310,26 @@ impl Stream for LanMouseListener {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.listen_rx.poll_next_unpin(cx)
+        let this = self.as_mut().get_mut();
+        let audio_event = match this.audio_rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some((addr, message))) => {
+                Some(ListenEvent::Audio { addr, message })
+            }
+            std::task::Poll::Ready(None) | std::task::Poll::Pending => None,
+        };
+        let listen_event = this.listen_rx.poll_next_unpin(cx);
+        let result = match (this.prefer_audio, audio_event, listen_event) {
+            (true, Some(event), _) => std::task::Poll::Ready(Some(event)),
+            (false, _, std::task::Poll::Ready(Some(event))) => std::task::Poll::Ready(Some(event)),
+            (_, Some(event), std::task::Poll::Ready(None) | std::task::Poll::Pending) => {
+                std::task::Poll::Ready(Some(event))
+            }
+            (_, None, std::task::Poll::Ready(Some(event))) => std::task::Poll::Ready(Some(event)),
+            (_, None, std::task::Poll::Ready(None)) => std::task::Poll::Ready(None),
+            (_, None, std::task::Poll::Pending) => std::task::Poll::Pending,
+        };
+        this.prefer_audio = !this.prefer_audio;
+        result
     }
 }
 
@@ -305,8 +339,9 @@ async fn read_loop(
     conn: ArcConn,
     clipboard: Arc<ClipboardPeer>,
     dtls_tx: Sender<ListenEvent>,
+    audio_tx: tokio::sync::mpsc::Sender<(SocketAddr, AudioMessage)>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_CLIPBOARD_FRAME_SIZE];
+    let mut b = [0u8; 2048];
 
     loop {
         let len = match conn.recv(&mut b).await {
@@ -324,6 +359,21 @@ async fn read_loop(
                     .expect("channel closed"),
                 Ok(None) => {}
                 Err(error) => log::debug!("ignoring invalid clipboard frame from {addr}: {error}"),
+            }
+            continue;
+        }
+        if is_audio_message(&b[..len]) {
+            if len > MAX_AUDIO_DATAGRAM_SIZE {
+                log::debug!("ignoring oversized audio frame from {addr}: {len} bytes");
+                continue;
+            }
+            match decode_audio_message(&b[..len]) {
+                Ok(message) => {
+                    if let Err(error) = audio_tx.try_send((addr, message)) {
+                        log::debug!("dropping audio frame from {addr}: {error}");
+                    }
+                }
+                Err(error) => log::debug!("ignoring invalid audio frame from {addr}: {error}"),
             }
             continue;
         }
@@ -355,5 +405,9 @@ async fn read_loop(
         return Ok(());
     };
     conns.remove(index);
+    drop(conns);
+    dtls_tx
+        .send(ListenEvent::Disconnected { addr })
+        .expect("channel closed");
     Ok(())
 }

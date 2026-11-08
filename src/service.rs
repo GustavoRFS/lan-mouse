@@ -408,6 +408,9 @@ impl Service {
                 log::trace!("clipboard update received from {addr}");
                 self.apply_remote_clipboard(update_id, payload);
             }
+            EmulationEvent::Audio { addr, message } => {
+                log::trace!("audio message received from authenticated peer {addr}: {message:?}");
+            }
         }
     }
 
@@ -438,6 +441,12 @@ impl Service {
             }
             ICaptureEvent::Clipboard { update_id, payload } => {
                 self.apply_remote_clipboard(update_id, payload);
+            }
+            ICaptureEvent::Audio { handle, message } => {
+                log::trace!("audio message received from outgoing peer {handle}: {message:?}");
+            }
+            ICaptureEvent::PeerDisconnected { handle } => {
+                log::debug!("outgoing peer {handle} disconnected");
             }
         }
     }

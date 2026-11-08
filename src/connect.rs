@@ -5,7 +5,8 @@ use crate::{
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
-    ClipboardFrame, ClipboardUpdateId, MAX_CLIPBOARD_FRAME_SIZE, MAX_EVENT_SIZE, ProtoEvent,
+    AudioMessage, ClipboardFrame, ClipboardUpdateId, MAX_AUDIO_DATAGRAM_SIZE, MAX_EVENT_SIZE,
+    ProtoEvent, decode_audio_message, is_audio_message,
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -57,6 +58,8 @@ struct ClientConnection {
 
 pub(crate) enum NetworkEvent {
     Proto(ProtoEvent),
+    Audio(AudioMessage),
+    Disconnected,
     Clipboard {
         update_id: ClipboardUpdateId,
         payload: ClipboardPayload,
@@ -119,6 +122,8 @@ pub(crate) struct LanMouseConnection {
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     recv_rx: Receiver<(ClientHandle, NetworkEvent)>,
     recv_tx: Sender<(ClientHandle, NetworkEvent)>,
+    audio_rx: tokio::sync::mpsc::Receiver<(ClientHandle, AudioMessage)>,
+    audio_tx: tokio::sync::mpsc::Sender<(ClientHandle, AudioMessage)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     reassembler: SharedClipboardReassembler,
 }
@@ -130,6 +135,7 @@ impl LanMouseConnection {
         reassembler: SharedClipboardReassembler,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(4);
         Self {
             cert,
             client_manager,
@@ -137,13 +143,21 @@ impl LanMouseConnection {
             connecting: Default::default(),
             recv_rx,
             recv_tx,
+            audio_rx,
+            audio_tx,
             ping_response: Default::default(),
             reassembler,
         }
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, NetworkEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+        tokio::select! {
+            event = self.recv_rx.recv() => event.expect("channel closed"),
+            audio = self.audio_rx.recv() => {
+                let (handle, message) = audio.expect("audio channel closed");
+                (handle, NetworkEvent::Audio(message))
+            }
+        }
     }
 
     pub(crate) async fn broadcast_clipboard(
@@ -200,7 +214,14 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.recv_tx,
+                        )
+                        .await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -220,6 +241,7 @@ impl LanMouseConnection {
                 self.conns.clone(),
                 self.connecting.clone(),
                 self.recv_tx.clone(),
+                self.audio_tx.clone(),
                 self.ping_response.clone(),
                 self.reassembler.clone(),
             ));
@@ -236,6 +258,7 @@ async fn connect_to_handle(
     conns: Rc<Mutex<HashMap<SocketAddr, ClientConnection>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, NetworkEvent)>,
+    audio_tx: tokio::sync::mpsc::Sender<(ClientHandle, AudioMessage)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     reassembler: SharedClipboardReassembler,
 ) -> Result<(), LanMouseConnectionError> {
@@ -294,6 +317,7 @@ async fn connect_to_handle(
             clipboard,
             conns,
             tx,
+            audio_tx,
             ping_response.clone(),
         ));
         return Ok(());
@@ -339,9 +363,10 @@ async fn receive_loop(
     clipboard: Arc<ClipboardPeer>,
     conns: Rc<Mutex<HashMap<SocketAddr, ClientConnection>>>,
     tx: Sender<(ClientHandle, NetworkEvent)>,
+    audio_tx: tokio::sync::mpsc::Sender<(ClientHandle, AudioMessage)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    let mut buf = [0u8; MAX_CLIPBOARD_FRAME_SIZE];
+    let mut buf = [0u8; 2048];
     loop {
         let len = match conn.recv(&mut buf).await {
             Ok(len) => len,
@@ -355,6 +380,22 @@ async fn receive_loop(
                 }
                 Ok(None) => {}
                 Err(error) => log::debug!("ignoring invalid clipboard frame from {addr}: {error}"),
+            }
+            continue;
+        }
+        if is_audio_message(&buf[..len]) {
+            if len > MAX_AUDIO_DATAGRAM_SIZE {
+                log::debug!("ignoring oversized audio frame from {addr}: {len} bytes");
+                continue;
+            }
+            match decode_audio_message(&buf[..len]) {
+                Ok(message) => {
+                    ping_response.borrow_mut().insert(addr);
+                    if let Err(error) = audio_tx.try_send((handle, message)) {
+                        log::debug!("dropping audio frame from {addr}: {error}");
+                    }
+                }
+                Err(error) => log::debug!("ignoring invalid audio frame from {addr}: {error}"),
             }
             continue;
         }
@@ -386,7 +427,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &tx).await;
 }
 
 async fn disconnect(
@@ -394,11 +435,16 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, ClientConnection>>,
+    tx: &Sender<(ClientHandle, NetworkEvent)>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
+    let removed = conns.lock().await.remove(&addr).is_some();
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    if removed {
+        tx.send((handle, NetworkEvent::Disconnected))
+            .expect("channel closed");
+    }
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
