@@ -8,6 +8,7 @@ members = [
     "lan-mouse-gtk",
     "lan-mouse-proto",
     "lan-mouse-transfer",
+    "lan-mouse-audio",
 ]
 
 [package]
