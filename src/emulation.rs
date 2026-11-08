@@ -3,7 +3,8 @@ use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
-use input_event::Event;
+use input_event::{Event, MonitorId};
+use lan_mouse_ipc::Position as IpcPosition;
 use lan_mouse_proto::{ClipboardUpdateId, KeyboardLayout, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -43,6 +44,12 @@ pub(crate) enum EmulationEvent {
         /// certificate fingerprint of the connection
         fingerprint: String,
     },
+    EnteredMonitor {
+        addr: SocketAddr,
+        monitor_id: MonitorId,
+        edge: IpcPosition,
+        fingerprint: String,
+    },
     /// connection closed
     Disconnected {
         addr: SocketAddr,
@@ -71,6 +78,11 @@ pub(crate) enum EmulationEvent {
         update_id: ClipboardUpdateId,
         payload: ClipboardPayload,
     },
+    PeerProtocol {
+        addr: SocketAddr,
+        fingerprint: String,
+        event: ProtoEvent,
+    },
 }
 
 enum EmulationRequest {
@@ -81,6 +93,7 @@ enum EmulationRequest {
         payload: ClipboardPayload,
     },
     CancelClipboardTransfers,
+    SendProto(SocketAddr, ProtoEvent),
     ChangePort(u16),
     Terminate,
 }
@@ -127,6 +140,12 @@ impl Emulation {
     pub(crate) fn cancel_clipboard_transfers(&self) {
         self.request_tx
             .send(EmulationRequest::CancelClipboardTransfers)
+            .expect("channel closed");
+    }
+
+    pub(crate) fn send_proto(&self, addr: SocketAddr, event: ProtoEvent) {
+        self.request_tx
+            .send(EmulationRequest::SendProto(addr, event))
             .expect("channel closed");
     }
 
@@ -190,6 +209,24 @@ impl ListenTask {
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
+                            ProtoEvent::EnterMonitor { monitor_id, edge } => {
+                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    let edge = to_ipc_pos(edge);
+                                    match self.emulation_proxy.enter_monitor(addr, monitor_id.clone(), edge).await {
+                                        Ok(()) => {
+                                            self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                            self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                            self.event_tx.send(EmulationEvent::EnteredMonitor {
+                                                addr,
+                                                monitor_id,
+                                                edge,
+                                                fingerprint,
+                                            }).expect("channel closed");
+                                        }
+                                        Err(error) => log::warn!("unable to enter monitor on {addr}: {error}"),
+                                    }
+                                }
+                            }
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -210,6 +247,24 @@ impl ListenTask {
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                            }
+                            ProtoEvent::MonitorGridCapabilities { version } => {
+                                self.listener.reply(addr, ProtoEvent::MonitorGridCapabilities { version: 1 }).await;
+                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    self.event_tx.send(EmulationEvent::PeerProtocol {
+                                        addr,
+                                        fingerprint,
+                                        event: ProtoEvent::MonitorGridCapabilities { version },
+                                    }).expect("channel closed");
+                                }
+                            }
+                            event @ ProtoEvent::MonitorCatalogRequest
+                            | event @ ProtoEvent::MonitorCatalogChunk { .. }
+                            | event @ ProtoEvent::GridSnapshotChunk { .. }
+                            | event @ ProtoEvent::GridSnapshotAck { .. } => {
+                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    self.event_tx.send(EmulationEvent::PeerProtocol { addr, fingerprint, event }).expect("channel closed");
+                                }
                             }
                             _ => {}
                         }
@@ -242,6 +297,7 @@ impl ListenTask {
                     EmulationRequest::CancelClipboardTransfers => {
                         self.listener.cancel_clipboard_transfers().await;
                     }
+                    EmulationRequest::SendProto(addr, event) => self.listener.reply(addr, event).await,
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -281,6 +337,12 @@ pub(crate) struct EmulationProxy {
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
+    EnterMonitor {
+        addr: SocketAddr,
+        monitor_id: MonitorId,
+        edge: IpcPosition,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     SetKeyboardLayout {
         addr: SocketAddr,
         layout: Option<KeyboardLayout>,
@@ -308,6 +370,7 @@ impl EmulationProxy {
             handles: Default::default(),
             next_id: 0,
             keyboard_layout_source: None,
+            pending_monitor_entries: Vec::new(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -343,6 +406,26 @@ impl EmulationProxy {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
             .expect("channel closed");
+    }
+
+    async fn enter_monitor(
+        &self,
+        addr: SocketAddr,
+        monitor_id: MonitorId,
+        edge: IpcPosition,
+    ) -> Result<(), String> {
+        let (response, response_rx) = oneshot::channel();
+        self.request_tx
+            .send(ProxyRequest::EnterMonitor {
+                addr,
+                monitor_id,
+                edge,
+                response,
+            })
+            .expect("channel closed");
+        response_rx
+            .await
+            .unwrap_or_else(|_| Err("input emulation stopped before monitor entry".into()))
     }
 
     async fn set_keyboard_layout(
@@ -387,6 +470,14 @@ struct EmulationTask {
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
     keyboard_layout_source: Option<(SocketAddr, Option<KeyboardLayout>)>,
+    pending_monitor_entries: Vec<PendingMonitorEntry>,
+}
+
+struct PendingMonitorEntry {
+    addr: SocketAddr,
+    monitor_id: MonitorId,
+    edge: IpcPosition,
+    response: oneshot::Sender<Result<(), String>>,
 }
 
 impl EmulationTask {
@@ -404,6 +495,9 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::EnterMonitor { response, .. } => {
+                        let _ = response.send(Err("input emulation is disabled".into()));
+                    }
                     ProxyRequest::Remove(addr) => {
                         self.handles.remove(&addr);
                         if self
@@ -446,6 +540,17 @@ impl EmulationTask {
                             self.keyboard_layout_source = None;
                         }
                     }
+                    ProxyRequest::EnterMonitor {
+                        addr,
+                        monitor_id,
+                        edge,
+                        response,
+                    } => self.pending_monitor_entries.push(PendingMonitorEntry {
+                        addr,
+                        monitor_id,
+                        edge,
+                        response,
+                    }),
                     ProxyRequest::Input(..) | ProxyRequest::Reenable => {}
                 }
             }
@@ -483,6 +588,18 @@ impl EmulationTask {
             }
         }
 
+        for pending in std::mem::take(&mut self.pending_monitor_entries) {
+            let result = self
+                .enter_monitor_for(
+                    &mut emulation,
+                    pending.addr,
+                    &pending.monitor_id,
+                    pending.edge,
+                )
+                .await;
+            let _ = pending.response.send(result);
+        }
+
         let res = self.do_emulation_session(&mut emulation).await;
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
@@ -504,6 +621,17 @@ impl EmulationTask {
                         self.keyboard_layout_source = Some((addr, layout));
                         pending_layout_responses.push(response);
                     }
+                    ProxyRequest::EnterMonitor {
+                        addr,
+                        monitor_id,
+                        edge,
+                        response,
+                    } => self.pending_monitor_entries.push(PendingMonitorEntry {
+                        addr,
+                        monitor_id,
+                        edge,
+                        response,
+                    }),
                     ProxyRequest::Input(..) | ProxyRequest::Remove(..) | ProxyRequest::Reenable => {}
                 }
             }
@@ -535,6 +663,26 @@ impl EmulationTask {
         Ok(())
     }
 
+    async fn enter_monitor_for(
+        &mut self,
+        emulation: &mut InputEmulation,
+        addr: SocketAddr,
+        monitor_id: &MonitorId,
+        edge: IpcPosition,
+    ) -> Result<(), String> {
+        if !self.handles.contains_key(&addr) {
+            let handle = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            emulation.create(handle).await;
+            self.handles.insert(addr, handle);
+        }
+        let handle = self.handles[&addr];
+        emulation
+            .enter_monitor(handle, monitor_id, edge)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn do_emulation_session(
         &mut self,
         emulation: &mut InputEmulation,
@@ -555,6 +703,10 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::EnterMonitor { addr, monitor_id, edge, response } => {
+                        let result = self.enter_monitor_for(emulation, addr, &monitor_id, edge).await;
+                        let _ = response.send(result);
+                    }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;

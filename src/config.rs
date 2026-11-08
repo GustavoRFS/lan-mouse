@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, MonitorGrid, Position};
 
 use input_event::scancode::{
     self,
@@ -72,6 +72,7 @@ struct ConfigToml {
     clipboard_sharing: Option<bool>,
     keyboard_layout: Option<String>,
     keyboard_variant: Option<String>,
+    monitor_grid: Option<MonitorGrid>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -474,6 +475,12 @@ impl Config {
             .unwrap_or(true)
     }
 
+    pub fn monitor_grid(&self) -> Option<MonitorGrid> {
+        self.config_toml
+            .as_ref()
+            .and_then(|config| config.monitor_grid.clone())
+    }
+
     /// path to certificate
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
@@ -561,6 +568,19 @@ impl Config {
         self.config_toml.as_mut().expect("config").clipboard_sharing = Some(enabled);
     }
 
+    pub fn set_monitor_grid(&mut self, grid: MonitorGrid) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml.as_mut().expect("config").monitor_grid = Some(grid);
+    }
+
+    pub fn clear_monitor_grid(&mut self) {
+        if let Some(config) = self.config_toml.as_mut() {
+            config.monitor_grid = None;
+        }
+    }
+
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
         log::info!("reading config from {:?}", self.config_path);
 
@@ -626,6 +646,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use input_event::MonitorId;
+    use lan_mouse_ipc::{GridPosition, MonitorGrid, MonitorGridEntry};
 
     #[test]
     fn keyboard_layout_comes_from_the_config_file() {
@@ -678,5 +700,27 @@ mod tests {
         assert_eq!(config_client.keyboard_layout.as_deref(), Some("es"));
         let toml_client = TomlClient::from(config_client);
         assert_eq!(toml_client.keyboard_layout.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn monitor_grid_round_trips_as_a_top_level_toml_snapshot() {
+        let grid = MonitorGrid::new(
+            12,
+            "local-fingerprint".into(),
+            vec![MonitorGridEntry {
+                owner_fingerprint: "local-fingerprint".into(),
+                monitor_id: MonitorId::new("\\\\?\\DISPLAY#OUTPUT".into()).unwrap(),
+                position: GridPosition { x: 0, y: 1 },
+            }],
+        )
+        .unwrap();
+        let config = ConfigToml {
+            monitor_grid: Some(grid.clone()),
+            ..Default::default()
+        };
+
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: ConfigToml = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.monitor_grid, Some(grid));
     }
 }

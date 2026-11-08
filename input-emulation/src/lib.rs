@@ -4,7 +4,8 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, MonitorId};
+use lan_mouse_ipc::Position;
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -29,6 +30,7 @@ mod macos;
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
+mod monitor_position;
 
 pub type EmulationHandle = u64;
 
@@ -165,11 +167,23 @@ impl InputEmulation {
         self.emulation.set_keyboard_layout(layout, variant).await
     }
 
+    /// Move the remote pointer to the midpoint of an edge on a named display.
+    pub async fn enter_monitor(
+        &mut self,
+        handle: EmulationHandle,
+        monitor_id: &MonitorId,
+        edge: Position,
+    ) -> Result<(), EmulationError> {
+        self.emulation.select_handle(handle);
+        self.emulation.enter_monitor(handle, monitor_id, edge).await
+    }
+
     pub async fn consume(
         &mut self,
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        self.emulation.select_handle(handle);
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // prevent double pressed / released keys
@@ -266,6 +280,18 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    fn select_handle(&mut self, _handle: EmulationHandle) {}
+    async fn enter_monitor(
+        &mut self,
+        _handle: EmulationHandle,
+        monitor_id: &MonitorId,
+        _edge: Position,
+    ) -> Result<(), EmulationError> {
+        Err(EmulationError::MonitorEntry(format!(
+            "backend cannot place pointer on output `{}`",
+            monitor_id.as_str()
+        )))
+    }
     async fn set_keyboard_layout(
         &mut self,
         _layout: Option<&str>,

@@ -124,14 +124,14 @@ Owning checks: `route_uses_exact_source_monitor_and_edge`, `entry_midpoint_uses_
 - Incoming `EnterMonitor` creates an enter-only capture point at the named local output; the source edge's opposite side is the target entry edge, and the emulation backend moves the pointer to that edge's midpoint before input begins.
 - `InputEmulation::enter_monitor(monitor_id: &MonitorId, edge: Position) -> Result<(), EmulationError>` resolves the output and places the virtual pointer at its edge midpoint. Windows uses virtual-desktop coordinates; wlroots uses output geometry and absolute virtual-pointer motion.
 
-- [ ] Add service-model tests named in Review Focus for exact monitor-edge routing, missing outputs, legacy fallback, and grid chunk retry/reassembly.
-- [ ] Run those tests on Windows and `gauss`; confirm they fail for the missing service behavior.
-- [ ] Add monitor-position tests proving midpoint entry is independent of source and destination resolutions and unknown output IDs return an error.
-- [ ] Run the monitor-position tests on Windows and `gauss`; confirm they fail because pointer placement is missing.
-- [ ] Implement TOML persistence, catalog discovery, snapshot sync, route selection, enter-only barrier setup, and reconnect replay.
-- [ ] Implement monitor-edge pointer placement for Windows and the wlroots virtual pointer; return a clear error for an unknown or disconnected output.
-- [ ] Run affected crate tests and `cargo check --workspace` on Windows and `gauss`.
-- [ ] Commit as `feat: route input through synchronized monitor grids`.
+- [x] Add service-model tests named in Review Focus for exact monitor-edge routing, missing outputs, legacy fallback, and grid chunk retry/reassembly.
+- [x] Run those tests on Windows and `gauss`; confirm they fail for the missing service behavior.
+- [x] Add monitor-position tests proving midpoint entry is independent of source and destination resolutions and unknown output IDs return an error.
+- [x] Run the monitor-position tests on Windows and `gauss`; confirm they fail because pointer placement is missing.
+- [x] Implement TOML persistence, catalog discovery, snapshot sync, route selection, enter-only barrier setup, and reconnect replay.
+- [x] Implement monitor-edge pointer placement for Windows and the wlroots virtual pointer; return a clear error for an unknown or disconnected output.
+- [x] Run affected crate tests and platform builds on Windows and `gauss`. Full GTK/workspace checks remain subject to the recorded baseline native-dependency and example failures.
+- [x] Commit as `feat: route input through synchronized monitor grids`.
 
 ### Task 4: GTK monitor-grid editor
 

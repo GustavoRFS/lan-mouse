@@ -323,6 +323,25 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_peer_fingerprint(&self, handle: ClientHandle, fingerprint: Option<String>) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.peer_fingerprint = fingerprint;
+        }
+    }
+
+    pub(crate) fn set_monitor_grid_version(&self, handle: ClientHandle, version: Option<u8>) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.monitor_grid_version = version;
+        }
+    }
+
+    pub(crate) fn supports_monitor_grid(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .is_some_and(|(_, state)| state.monitor_grid_version.unwrap_or(0) >= 1)
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()

@@ -15,8 +15,13 @@ use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1 as VpManager,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1 as Vp,
@@ -31,11 +36,13 @@ use xkbcommon::xkb;
 
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
-    globals::{GlobalListContents, registry_queue_init},
+    globals::{Global, GlobalList, GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
+use super::monitor_position::{MonitorGeometry, resolve_entry_midpoint};
+use input_event::{Event, KeyboardEvent, MonitorId, PointerEvent, scancode};
+use lan_mouse_ipc::Position;
 
 use super::EmulationHandle;
 use super::error::WaylandBindError;
@@ -57,6 +64,25 @@ struct State {
     qh: QueueHandle<Self>,
     vpm: VpManager,
     vkm: VkManager,
+    global_list: GlobalList,
+    xdg_output_manager: ZxdgOutputManagerV1,
+    outputs: Vec<Output>,
+    last_pointer_handle: Option<EmulationHandle>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OutputInfo {
+    name: String,
+    position: (i32, i32),
+    size: (i32, i32),
+}
+
+struct Output {
+    global: Global,
+    wl_output: WlOutput,
+    info: Option<OutputInfo>,
+    pending_info: OutputInfo,
+    has_xdg_info: bool,
 }
 
 // App State, implements Dispatch event handlers
@@ -82,6 +108,9 @@ impl WlrootsEmulation {
         let vkm: VkManager = globals
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
+        let xdg_output_manager: ZxdgOutputManagerV1 = globals
+            .bind(&qh, 1..=3, ())
+            .map_err(|e| WaylandBindError::new(e, "xdg_output_manager 1..=3"))?;
 
         let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
         let configured_keymap = options.keyboard_layout.as_deref().and_then(|layout| {
@@ -109,10 +138,18 @@ impl WlrootsEmulation {
                 seat,
                 vpm,
                 vkm,
+                global_list: globals,
+                xdg_output_manager,
+                outputs: Vec::new(),
+                last_pointer_handle: None,
                 qh,
             },
             queue,
         };
+        for global in emulate.state.global_list.contents().clone_list() {
+            emulate.state.register_global(global);
+        }
+        emulate.queue.flush()?;
         while emulate.state.keymap.is_none() && emulate.state.configured_keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
         }
@@ -124,6 +161,63 @@ impl WlrootsEmulation {
 }
 
 impl State {
+    fn register_global(&mut self, global: Global) {
+        if global.interface.as_str() != "wl_output" {
+            return;
+        }
+        let version = global.version.min(4);
+        let output = self.global_list.registry().bind::<WlOutput, _, _>(
+            global.name,
+            version,
+            &self.qh,
+            global.name,
+        );
+        self.xdg_output_manager
+            .get_xdg_output(&output, &self.qh, global.name);
+        self.outputs.push(Output {
+            global,
+            wl_output: output,
+            info: None,
+            pending_info: OutputInfo::default(),
+            has_xdg_info: false,
+        });
+    }
+
+    fn deregister_global(&mut self, name: u32) {
+        self.outputs.retain(|output| {
+            if output.global.name == name {
+                output.wl_output.release();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn update_output_info(&mut self, name: u32) {
+        if let Some(output) = self.outputs.iter_mut().find(|o| o.global.name == name) {
+            if output.has_xdg_info {
+                output.info = Some(output.pending_info.clone());
+            }
+        }
+    }
+
+    fn monitor_geometries(&self) -> Vec<MonitorGeometry> {
+        self.outputs
+            .iter()
+            .filter_map(|output| {
+                let info = output.info.as_ref()?;
+                Some(MonitorGeometry {
+                    id: MonitorId::new(info.name.clone()).ok()?,
+                    x: info.position.0,
+                    y: info.position.1,
+                    width: u32::try_from(info.size.0).ok()?,
+                    height: u32::try_from(info.size.1).ok()?,
+                })
+            })
+            .collect()
+    }
+
     fn add_client(&mut self, client: EmulationHandle) {
         let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
 
@@ -153,6 +247,7 @@ impl State {
         };
 
         self.input_for_client.insert(client, vinput);
+        self.last_pointer_handle = Some(client);
     }
 
     fn destroy_client(&mut self, handle: EmulationHandle) {
@@ -209,12 +304,69 @@ impl Emulation for WlrootsEmulation {
     }
     async fn destroy(&mut self, handle: EmulationHandle) {
         self.state.destroy_client(handle);
+        if self.state.last_pointer_handle == Some(handle) {
+            self.state.last_pointer_handle = self.state.input_for_client.keys().next().copied();
+        }
         if let Err(e) = self.queue.flush() {
             log::error!("{e}");
         }
     }
+    fn select_handle(&mut self, handle: EmulationHandle) {
+        if self.state.input_for_client.contains_key(&handle) {
+            self.state.last_pointer_handle = Some(handle);
+        }
+    }
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+
+    async fn enter_monitor(
+        &mut self,
+        _handle: EmulationHandle,
+        monitor_id: &MonitorId,
+        edge: Position,
+    ) -> Result<(), EmulationError> {
+        let geometries = self.state.monitor_geometries();
+        let target = resolve_entry_midpoint(&geometries, monitor_id, edge)
+            .map_err(|error| EmulationError::MonitorEntry(error.to_string()))?;
+        let min_x = geometries.iter().map(|output| output.x).min().unwrap_or(0);
+        let min_y = geometries.iter().map(|output| output.y).min().unwrap_or(0);
+        let max_x = geometries
+            .iter()
+            .map(|output| output.x.saturating_add(output.width as i32))
+            .max()
+            .unwrap_or(0);
+        let max_y = geometries
+            .iter()
+            .map(|output| output.y.saturating_add(output.height as i32))
+            .max()
+            .unwrap_or(0);
+        let width = max_x.saturating_sub(min_x).max(1) as u32;
+        let height = max_y.saturating_sub(min_y).max(1) as u32;
+        let Some(handle) = self.state.last_pointer_handle else {
+            return Err(EmulationError::MonitorEntry(
+                "no virtual pointer is available for the peer".to_owned(),
+            ));
+        };
+        let Some(input) = self.state.input_for_client.get(&handle) else {
+            return Err(EmulationError::MonitorEntry(
+                "no virtual pointer is available for the peer".to_owned(),
+            ));
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+        input.pointer.motion_absolute(
+            now,
+            target.x.saturating_sub(min_x).max(0) as u32,
+            target.y.saturating_sub(min_y).max(0) as u32,
+            width,
+            height,
+        );
+        input.pointer.frame();
+        self.queue.flush()?;
+        Ok(())
     }
 
     async fn set_keyboard_layout(
@@ -373,18 +525,83 @@ delegate_noop!(State: Vp);
 delegate_noop!(State: Vk);
 delegate_noop!(State: VpManager);
 delegate_noop!(State: VkManager);
+delegate_noop!(State: ZxdgOutputManagerV1);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
-        _: &mut State,
+        state: &mut State,
         _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
+        event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                state.register_global(Global {
+                    name,
+                    interface,
+                    version,
+                });
+            }
+            wl_registry::Event::GlobalRemove { name } => state.deregister_global(name),
+            _ => {}
+        }
     }
 }
+
+impl Dispatch<ZxdgOutputV1, u32> for State {
+    fn event(
+        state: &mut State,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        name: &u32,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        let Some(output) = state.outputs.iter_mut().find(|o| o.global.name == *name) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                output.pending_info.position = (x, y);
+                output.has_xdg_info = true;
+            }
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                output.pending_info.size = (width, height);
+                output.has_xdg_info = true;
+            }
+            zxdg_output_v1::Event::Name { name } => {
+                output.pending_info.name = name;
+                output.has_xdg_info = true;
+            }
+            zxdg_output_v1::Event::Description { .. } => {}
+            zxdg_output_v1::Event::Done => state.update_output_info(*name),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, u32> for State {
+    fn event(
+        state: &mut State,
+        _: &WlOutput,
+        event: wl_output::Event,
+        name: &u32,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let wl_output::Event::Done = event {
+            state.update_output_info(*name);
+        }
+    }
+}
+
+delegate_noop!(State: ZxdgOutputV1);
 
 impl Dispatch<WlKeyboard, ()> for State {
     fn event(

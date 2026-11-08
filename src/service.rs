@@ -9,12 +9,18 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     file_transfer::FileTransferServer,
     listen::{LanMouseListener, ListenerCreationError},
+    monitor_grid::{
+        GridSnapshotReassembler, GridSnapshotSender, GridSnapshotUpdate, MonitorCatalogReassembler,
+        catalog_chunks,
+    },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
+use input_capture::CapturePoint;
+use input_event::{MonitorDescriptor, MonitorId};
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, RemoteFileOffer, Status,
+    IpcListenerCreationError, MonitorGrid, Position, RemoteFileOffer, Status,
 };
 use lan_mouse_proto::{
     ClipboardReassembler, ClipboardUpdateId, FileOfferAnnouncement, MAX_CLIPBOARD_IMAGE_BYTES,
@@ -83,6 +89,15 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    monitor_grid: Option<MonitorGrid>,
+    local_monitor_catalog: Vec<MonitorDescriptor>,
+    remote_monitor_catalogs: HashMap<String, Vec<MonitorDescriptor>>,
+    catalog_reassemblers: HashMap<String, MonitorCatalogReassembler>,
+    grid_reassembler: GridSnapshotReassembler,
+    grid_senders: HashMap<ClientHandle, GridSnapshotSender>,
+    incoming_grid_senders: HashMap<SocketAddr, GridSnapshotSender>,
+    incoming_fingerprints: HashMap<SocketAddr, String>,
+    peer_capabilities: HashMap<String, u8>,
 }
 
 #[derive(Debug)]
@@ -90,6 +105,7 @@ struct Incoming {
     fingerprint: String,
     addr: SocketAddr,
     pos: Position,
+    monitor_id: Option<MonitorId>,
 }
 
 impl Service {
@@ -103,6 +119,7 @@ impl Service {
         let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
         let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
         let clipboard_sharing = config.clipboard_sharing();
+        let monitor_grid = config.monitor_grid();
         let clipboard_origin: [u8; 8] = uuid::Uuid::new_v4().as_bytes()[..8]
             .try_into()
             .expect("UUID prefix length");
@@ -128,6 +145,7 @@ impl Service {
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
+        capture.set_monitor_grid(monitor_grid.clone(), public_key_fingerprint.clone());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, config.emulation_options(), listener);
 
@@ -156,11 +174,21 @@ impl Service {
             clipboard_origin,
             clipboard_sequence: 0,
             file_transfer,
+            monitor_grid,
+            local_monitor_catalog: Vec::new(),
+            remote_monitor_catalogs: HashMap::new(),
+            catalog_reassemblers: HashMap::new(),
+            grid_reassembler: GridSnapshotReassembler::default(),
+            grid_senders: HashMap::new(),
+            incoming_grid_senders: HashMap::new(),
+            incoming_fingerprints: HashMap::new(),
+            peer_capabilities: HashMap::new(),
         };
         Ok(service)
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
+        let mut grid_retry = tokio::time::interval(std::time::Duration::from_secs(2));
         let active = self.client_manager.active_clients();
         for handle in active.iter() {
             // small hack: `activate_client()` checks, if the client
@@ -180,6 +208,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                _ = grid_retry.tick() => self.retry_grid_snapshots(),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -275,6 +304,375 @@ impl Service {
                 self.share_local_clipboard_image(png_base64)
             }
             FrontendRequest::ClipboardFiles(paths) => self.share_local_clipboard_files(paths),
+            FrontendRequest::DiscoverMonitors(handle) => self.discover_monitors(handle),
+            FrontendRequest::UpdateMonitorGrid(grid) => self.update_monitor_grid(grid),
+        }
+    }
+
+    fn rebuild_active_client_captures(&self) {
+        for handle in self.client_manager.active_clients() {
+            self.capture.replace_points(
+                handle,
+                self.capture_points_for_client(handle),
+                CaptureType::Default,
+            );
+        }
+    }
+
+    fn capture_points_for_client(&self, handle: ClientHandle) -> Vec<CapturePoint> {
+        let Some((config, state)) = self.client_manager.get_state(handle) else {
+            return Vec::new();
+        };
+        if !self.client_manager.supports_monitor_grid(handle) {
+            return vec![CapturePoint::directional(capture_position(config.pos))];
+        }
+        let (Some(peer_fingerprint), Some(_), true) =
+            (state.peer_fingerprint, state.active_addr, state.alive)
+        else {
+            return Vec::new();
+        };
+        let Some(grid) = self.monitor_grid.as_ref() else {
+            return Vec::new();
+        };
+        let available_catalogs = self
+            .remote_monitor_catalogs
+            .iter()
+            .map(|(owner, monitors)| {
+                (
+                    owner.clone(),
+                    monitors.iter().map(|monitor| monitor.id.clone()).collect(),
+                )
+            })
+            .collect::<HashMap<String, HashSet<MonitorId>>>();
+        let local_outputs = self
+            .local_monitor_catalog
+            .iter()
+            .map(|monitor| monitor.id.clone())
+            .collect::<HashSet<_>>();
+        let mut points = Vec::new();
+        for source in &grid.entries {
+            if source.owner_fingerprint != self.public_key_fingerprint
+                || !local_outputs.contains(&source.monitor_id)
+            {
+                continue;
+            }
+            for edge in [
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ] {
+                let Some(target) = crate::monitor_grid::route_available(
+                    grid,
+                    &available_catalogs,
+                    &self.public_key_fingerprint,
+                    &source.monitor_id,
+                    edge,
+                ) else {
+                    continue;
+                };
+                if target.owner_fingerprint == peer_fingerprint {
+                    let point = CapturePoint {
+                        monitor_id: Some(source.monitor_id.clone()),
+                        edge: capture_position(edge),
+                    };
+                    if !points.contains(&point) {
+                        points.push(point);
+                    }
+                }
+            }
+        }
+        points
+    }
+
+    fn discover_monitors(&mut self, handle: ClientHandle) {
+        if self.client_manager.get_state(handle).is_none() {
+            self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+            return;
+        }
+        self.capture.discover_monitors(handle);
+    }
+
+    fn update_monitor_grid(&mut self, proposed: MonitorGrid) {
+        if let Err(error) = proposed.validate() {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid monitor grid: {error}"
+            )));
+            return;
+        }
+        let revision = self
+            .monitor_grid
+            .as_ref()
+            .map_or(1, |grid| grid.revision.saturating_add(1));
+        let grid = match MonitorGrid::new(
+            revision,
+            self.public_key_fingerprint.clone(),
+            proposed.entries,
+        ) {
+            Ok(grid) => grid,
+            Err(error) => {
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "invalid monitor grid: {error}"
+                )));
+                return;
+            }
+        };
+        self.apply_monitor_grid(grid, None);
+    }
+
+    fn apply_monitor_grid(&mut self, grid: MonitorGrid, source: Option<ClientHandle>) {
+        self.monitor_grid = Some(grid.clone());
+        self.capture
+            .set_monitor_grid(Some(grid.clone()), self.public_key_fingerprint.clone());
+        self.rebuild_active_client_captures();
+        self.config.set_monitor_grid(grid.clone());
+        self.save_config();
+        self.notify_frontend(FrontendEvent::MonitorGridUpdated(grid));
+        for handle in self.client_manager.registered_clients() {
+            if Some(handle) != source && self.client_manager.supports_monitor_grid(handle) {
+                self.send_grid_snapshot(handle);
+            }
+        }
+        let incoming = self
+            .incoming_fingerprints
+            .iter()
+            .filter(|(_, fingerprint)| {
+                self.peer_capabilities
+                    .get(fingerprint.as_str())
+                    .is_some_and(|version| *version >= 1)
+            })
+            .map(|(addr, _)| *addr)
+            .collect::<Vec<_>>();
+        for addr in incoming {
+            self.send_grid_snapshot_to_addr(addr);
+        }
+    }
+
+    fn send_grid_snapshot(&mut self, handle: ClientHandle) {
+        let Some(grid) = self.monitor_grid.as_ref() else {
+            return;
+        };
+        let Ok(sender) = GridSnapshotSender::new(grid) else {
+            self.notify_frontend(FrontendEvent::Error(
+                "monitor grid is too large to sync".into(),
+            ));
+            return;
+        };
+        let chunks = sender.pending_chunks();
+        self.grid_senders.insert(handle, sender);
+        for chunk in chunks {
+            self.capture.send_proto(handle, chunk);
+        }
+    }
+
+    fn retry_grid_snapshots(&mut self) {
+        let retries = self
+            .grid_senders
+            .iter()
+            .map(|(handle, sender)| (*handle, sender.retry_unacknowledged()))
+            .collect::<Vec<_>>();
+        for (handle, chunks) in retries {
+            for chunk in chunks {
+                self.capture.send_proto(handle, chunk);
+            }
+        }
+        let retries = self
+            .incoming_grid_senders
+            .iter()
+            .map(|(addr, sender)| (*addr, sender.retry_unacknowledged()))
+            .collect::<Vec<_>>();
+        for (addr, chunks) in retries {
+            for chunk in chunks {
+                self.emulation.send_proto(addr, chunk);
+            }
+        }
+    }
+
+    fn send_local_catalog(&self, handle: ClientHandle) {
+        let transfer_id = uuid::Uuid::new_v4().as_u128() as u32;
+        for event in catalog_chunks(transfer_id, &self.local_monitor_catalog) {
+            self.capture.send_proto(handle, event);
+        }
+    }
+
+    fn send_local_catalog_to_addr(&self, addr: SocketAddr) {
+        let transfer_id = uuid::Uuid::new_v4().as_u128() as u32;
+        for event in catalog_chunks(transfer_id, &self.local_monitor_catalog) {
+            self.emulation.send_proto(addr, event);
+        }
+    }
+
+    fn send_grid_snapshot_to_addr(&mut self, addr: SocketAddr) {
+        let Some(grid) = self.monitor_grid.as_ref() else {
+            return;
+        };
+        let Ok(sender) = GridSnapshotSender::new(grid) else {
+            return;
+        };
+        let chunks = sender.pending_chunks();
+        self.incoming_grid_senders.insert(addr, sender);
+        for chunk in chunks {
+            self.emulation.send_proto(addr, chunk);
+        }
+    }
+
+    fn handle_peer_protocol(&mut self, handle: ClientHandle, event: lan_mouse_proto::ProtoEvent) {
+        use lan_mouse_proto::ProtoEvent;
+        match event {
+            ProtoEvent::MonitorGridCapabilities { version } => {
+                self.client_manager
+                    .set_monitor_grid_version(handle, Some(version));
+                self.broadcast_client(handle);
+                if version >= 1 {
+                    self.send_grid_snapshot(handle);
+                    self.send_local_catalog(handle);
+                }
+            }
+            ProtoEvent::MonitorCatalogRequest => self.send_local_catalog(handle),
+            event @ ProtoEvent::MonitorCatalogChunk { .. } => {
+                let Some(fingerprint) = self
+                    .client_manager
+                    .get_state(handle)
+                    .and_then(|(_, state)| state.peer_fingerprint)
+                else {
+                    return;
+                };
+                let reassembler = self
+                    .catalog_reassemblers
+                    .entry(fingerprint.clone())
+                    .or_default();
+                match reassembler.push(event) {
+                    Ok(Some(monitors)) => {
+                        self.remote_monitor_catalogs
+                            .insert(fingerprint.clone(), monitors.clone());
+                        self.rebuild_active_client_captures();
+                        self.notify_frontend(FrontendEvent::RemoteMonitorCatalog {
+                            owner_fingerprint: fingerprint,
+                            monitors,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => log::debug!("ignoring invalid monitor catalog: {error}"),
+                }
+            }
+            event @ ProtoEvent::GridSnapshotChunk { .. } => {
+                match self.grid_reassembler.push(event) {
+                    Ok(Some(GridSnapshotUpdate::Applied(grid))) => {
+                        self.capture.send_proto(
+                            handle,
+                            ProtoEvent::GridSnapshotAck {
+                                revision: grid.revision,
+                                origin_fingerprint: grid.origin_fingerprint.clone(),
+                            },
+                        );
+                        self.apply_monitor_grid(grid, Some(handle));
+                    }
+                    Ok(Some(GridSnapshotUpdate::Stale {
+                        revision,
+                        origin_fingerprint,
+                    })) => self.capture.send_proto(
+                        handle,
+                        ProtoEvent::GridSnapshotAck {
+                            revision,
+                            origin_fingerprint,
+                        },
+                    ),
+                    Ok(None) => {}
+                    Err(error) => log::debug!("ignoring invalid monitor grid snapshot: {error}"),
+                }
+            }
+            ProtoEvent::GridSnapshotAck {
+                revision,
+                origin_fingerprint,
+            } => {
+                if let Some(sender) = self.grid_senders.get_mut(&handle) {
+                    if sender.acknowledge(revision, &origin_fingerprint)
+                        && sender.pending_chunks().is_empty()
+                    {
+                        self.grid_senders.remove(&handle);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_incoming_peer_protocol(
+        &mut self,
+        addr: SocketAddr,
+        fingerprint: String,
+        event: lan_mouse_proto::ProtoEvent,
+    ) {
+        use lan_mouse_proto::ProtoEvent;
+        match event {
+            ProtoEvent::MonitorGridCapabilities { version } => {
+                self.peer_capabilities.insert(fingerprint.clone(), version);
+                self.emulation
+                    .send_proto(addr, ProtoEvent::MonitorGridCapabilities { version: 1 });
+                self.send_local_catalog_to_addr(addr);
+                if version >= 1 {
+                    self.send_grid_snapshot_to_addr(addr);
+                }
+            }
+            ProtoEvent::MonitorCatalogRequest => self.send_local_catalog_to_addr(addr),
+            event @ ProtoEvent::MonitorCatalogChunk { .. } => {
+                let reassembler = self
+                    .catalog_reassemblers
+                    .entry(fingerprint.clone())
+                    .or_default();
+                match reassembler.push(event) {
+                    Ok(Some(monitors)) => {
+                        self.remote_monitor_catalogs
+                            .insert(fingerprint.clone(), monitors.clone());
+                        self.rebuild_active_client_captures();
+                        self.notify_frontend(FrontendEvent::RemoteMonitorCatalog {
+                            owner_fingerprint: fingerprint,
+                            monitors,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => log::debug!("ignoring invalid monitor catalog: {error}"),
+                }
+            }
+            event @ ProtoEvent::GridSnapshotChunk { .. } => {
+                match self.grid_reassembler.push(event) {
+                    Ok(Some(GridSnapshotUpdate::Applied(grid))) => {
+                        self.emulation.send_proto(
+                            addr,
+                            ProtoEvent::GridSnapshotAck {
+                                revision: grid.revision,
+                                origin_fingerprint: grid.origin_fingerprint.clone(),
+                            },
+                        );
+                        self.apply_monitor_grid(grid, None);
+                    }
+                    Ok(Some(GridSnapshotUpdate::Stale {
+                        revision,
+                        origin_fingerprint,
+                    })) => self.emulation.send_proto(
+                        addr,
+                        ProtoEvent::GridSnapshotAck {
+                            revision,
+                            origin_fingerprint,
+                        },
+                    ),
+                    Ok(None) => {}
+                    Err(error) => log::debug!("ignoring invalid monitor grid snapshot: {error}"),
+                }
+            }
+            ProtoEvent::GridSnapshotAck {
+                revision,
+                origin_fingerprint,
+            } => {
+                if let Some(sender) = self.incoming_grid_senders.get_mut(&addr) {
+                    if sender.acknowledge(revision, &origin_fingerprint)
+                        && sender.pending_chunks().is_empty()
+                    {
+                        self.incoming_grid_senders.remove(&addr);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -294,6 +692,11 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
+        if let Some(grid) = self.monitor_grid.clone() {
+            self.config.set_monitor_grid(grid);
+        } else {
+            self.config.clear_monitor_grid();
+        }
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
         self.config.set_clipboard_sharing(self.clipboard_sharing);
@@ -325,6 +728,13 @@ impl Service {
             self.file_transfer.withdraw();
         }
         self.clipboard_sharing = clipboard_sharing;
+        let monitor_grid = self.config.monitor_grid();
+        if monitor_grid != self.monitor_grid {
+            self.monitor_grid = monitor_grid.clone();
+            self.capture
+                .set_monitor_grid(monitor_grid, self.public_key_fingerprint.clone());
+            self.rebuild_active_client_captures();
+        }
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -351,17 +761,40 @@ impl Service {
             } => {
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
-                    self.add_incoming(addr, pos, fingerprint.clone());
+                    self.add_incoming(addr, pos, fingerprint.clone(), None);
                     self.notify_frontend(FrontendEvent::DeviceEntered {
                         fingerprint,
                         addr,
                         pos,
                     });
                 } else {
-                    self.update_incoming(addr, pos, fingerprint);
+                    self.update_incoming(addr, pos, fingerprint, None);
+                }
+            }
+            EmulationEvent::EnteredMonitor {
+                addr,
+                monitor_id,
+                edge,
+                fingerprint,
+            } => {
+                if !self.incoming_conns.contains(&addr) {
+                    self.add_incoming(addr, edge, fingerprint.clone(), Some(monitor_id));
+                    self.notify_frontend(FrontendEvent::DeviceEntered {
+                        fingerprint,
+                        addr,
+                        pos: edge,
+                    });
+                } else {
+                    self.update_incoming(addr, edge, fingerprint, Some(monitor_id));
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                if let Some(fingerprint) = self.incoming_fingerprints.remove(&addr) {
+                    self.peer_capabilities.remove(&fingerprint);
+                    self.remote_monitor_catalogs.remove(&fingerprint);
+                    self.catalog_reassemblers.remove(&fingerprint);
+                }
+                self.incoming_grid_senders.remove(&addr);
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -385,6 +818,7 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                self.incoming_fingerprints.insert(addr, fingerprint.clone());
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -406,6 +840,11 @@ impl Service {
                 log::trace!("clipboard update received from {addr}");
                 self.apply_remote_clipboard(update_id, payload);
             }
+            EmulationEvent::PeerProtocol {
+                addr,
+                fingerprint,
+                event,
+            } => self.handle_incoming_peer_protocol(addr, fingerprint, event),
         }
     }
 
@@ -436,6 +875,29 @@ impl Service {
             }
             ICaptureEvent::Clipboard { update_id, payload } => {
                 self.apply_remote_clipboard(update_id, payload);
+            }
+            ICaptureEvent::LocalMonitorCatalog(monitors) => {
+                self.local_monitor_catalog = monitors.clone();
+                self.notify_frontend(FrontendEvent::LocalMonitorCatalog(monitors));
+                self.rebuild_active_client_captures();
+            }
+            ICaptureEvent::PeerConnected(handle) => {
+                if self.client_manager.supports_monitor_grid(handle) {
+                    self.send_grid_snapshot(handle);
+                    self.send_local_catalog(handle);
+                }
+            }
+            ICaptureEvent::PeerDisconnected(handle) => {
+                self.grid_senders.remove(&handle);
+                self.rebuild_active_client_captures();
+                self.broadcast_client(handle);
+            }
+            ICaptureEvent::PeerStatus(handle) => {
+                self.rebuild_active_client_captures();
+                self.broadcast_client(handle);
+            }
+            ICaptureEvent::PeerProtocol { handle, event } => {
+                self.handle_peer_protocol(handle, event);
             }
         }
     }
@@ -474,6 +936,23 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
+        if let Some(grid) = self.monitor_grid.clone() {
+            self.notify_frontend(FrontendEvent::MonitorGridUpdated(grid));
+        }
+        self.notify_frontend(FrontendEvent::LocalMonitorCatalog(
+            self.local_monitor_catalog.clone(),
+        ));
+        let remote_catalogs = self
+            .remote_monitor_catalogs
+            .iter()
+            .map(|(owner, monitors)| (owner.clone(), monitors.clone()))
+            .collect::<Vec<_>>();
+        for (owner_fingerprint, monitors) in remote_catalogs {
+            self.notify_frontend(FrontendEvent::RemoteMonitorCatalog {
+                owner_fingerprint,
+                monitors,
+            });
+        }
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
@@ -593,10 +1072,21 @@ impl Service {
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
 
-    fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
+    fn add_incoming(
+        &mut self,
+        addr: SocketAddr,
+        pos: Position,
+        fingerprint: String,
+        monitor_id: Option<MonitorId>,
+    ) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        if let Some(monitor_id) = monitor_id.clone() {
+            self.capture
+                .create_monitor(handle, monitor_id, pos, CaptureType::EnterOnly);
+        } else {
+            self.capture.create(handle, pos, CaptureType::EnterOnly);
+        }
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -604,11 +1094,18 @@ impl Service {
                 fingerprint,
                 addr,
                 pos,
+                monitor_id,
             },
         );
     }
 
-    fn update_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
+    fn update_incoming(
+        &mut self,
+        addr: SocketAddr,
+        pos: Position,
+        fingerprint: String,
+        monitor_id: Option<MonitorId>,
+    ) {
         let incoming = self
             .incoming_conn_info
             .iter_mut()
@@ -624,9 +1121,13 @@ impl Service {
             incoming.pos = pos;
             changed = true;
         }
+        if incoming.monitor_id != monitor_id {
+            incoming.monitor_id = monitor_id.clone();
+            changed = true;
+        }
         if changed {
             self.remove_incoming(addr);
-            self.add_incoming(addr, pos, fingerprint.clone());
+            self.add_incoming(addr, pos, fingerprint.clone(), monitor_id);
             self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             self.notify_frontend(FrontendEvent::DeviceEntered {
                 fingerprint,
@@ -715,7 +1216,11 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            self.capture.create_points(
+                handle,
+                self.capture_points_for_client(handle),
+                CaptureType::Default,
+            );
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -813,6 +1318,15 @@ impl Service {
                 Err(e) => log::warn!("{kind} hook for client {handle} ({cmd}): {e}"),
             }
         });
+    }
+}
+
+fn capture_position(position: Position) -> input_capture::Position {
+    match position {
+        Position::Left => input_capture::Position::Left,
+        Position::Right => input_capture::Position::Right,
+        Position::Top => input_capture::Position::Top,
+        Position::Bottom => input_capture::Position::Bottom,
     }
 }
 

@@ -1,7 +1,9 @@
 use crate::config::Config;
 use clap::Args;
 use futures::StreamExt;
-use input_capture::{self, CaptureError, CaptureEvent, InputCapture, InputCaptureError, Position};
+use input_capture::{
+    self, CaptureError, CaptureEvent, CapturePoint, InputCapture, InputCaptureError, Position,
+};
 use input_event::{Event, KeyboardEvent};
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
@@ -14,11 +16,21 @@ pub async fn run(config: Config, _args: TestCaptureArgs) -> Result<(), InputCapt
     loop {
         let mut input_capture = InputCapture::new(backend).await?;
         log::info!("creating clients");
-        input_capture.create(0, Position::Left).await?;
-        input_capture.create(4, Position::Left).await?;
-        input_capture.create(1, Position::Right).await?;
-        input_capture.create(2, Position::Top).await?;
-        input_capture.create(3, Position::Bottom).await?;
+        input_capture
+            .create(0, vec![CapturePoint::directional(Position::Left)])
+            .await?;
+        input_capture
+            .create(4, vec![CapturePoint::directional(Position::Left)])
+            .await?;
+        input_capture
+            .create(1, vec![CapturePoint::directional(Position::Right)])
+            .await?;
+        input_capture
+            .create(2, vec![CapturePoint::directional(Position::Top)])
+            .await?;
+        input_capture
+            .create(3, vec![CapturePoint::directional(Position::Bottom)])
+            .await?;
         if let Err(e) = do_capture(&mut input_capture).await {
             log::warn!("{e} - recreating capture");
         }
@@ -28,7 +40,7 @@ pub async fn run(config: Config, _args: TestCaptureArgs) -> Result<(), InputCapt
 
 async fn do_capture(input_capture: &mut InputCapture) -> Result<(), CaptureError> {
     loop {
-        let (client, event) = input_capture
+        let (client, point, event) = input_capture
             .next()
             .await
             .ok_or(CaptureError::EndOfStream)??;
@@ -39,7 +51,7 @@ async fn do_capture(input_capture: &mut InputCapture) -> Result<(), CaptureError
             3 => Position::Bottom,
             _ => panic!(),
         };
-        log::info!("position: {client} ({pos}), event: {event}");
+        log::info!("position: {client} ({pos}, {point:?}), event: {event}");
         if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key: 1, .. })) = event {
             input_capture.release().await?;
             break Ok(());

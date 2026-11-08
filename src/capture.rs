@@ -6,9 +6,11 @@ use std::{
 
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, CapturePoint, InputCapture, InputCaptureError,
 };
+use input_event::MonitorDescriptor;
 use input_event::{Event, KeyboardEvent, scancode};
+use lan_mouse_ipc::MonitorGrid;
 use lan_mouse_proto::{ClipboardUpdateId, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -50,6 +52,14 @@ pub(crate) enum ICaptureEvent {
         update_id: ClipboardUpdateId,
         payload: ClipboardPayload,
     },
+    LocalMonitorCatalog(Vec<MonitorDescriptor>),
+    PeerConnected(CaptureHandle),
+    PeerDisconnected(CaptureHandle),
+    PeerStatus(CaptureHandle),
+    PeerProtocol {
+        handle: CaptureHandle,
+        event: ProtoEvent,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +77,7 @@ enum CaptureRequest {
     /// capture must release the mouse
     Release,
     /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    Create(CaptureHandle, Vec<CapturePoint>, CaptureType),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
@@ -79,6 +89,9 @@ enum CaptureRequest {
         payload: ClipboardPayload,
     },
     CancelClipboardTransfers,
+    DiscoverMonitors(CaptureHandle),
+    SendProto(CaptureHandle, ProtoEvent),
+    SetMonitorGrid(Option<MonitorGrid>, String),
 }
 
 impl Capture {
@@ -100,6 +113,8 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            monitor_grid: None,
+            local_fingerprint: String::new(),
             last_keyboard_layout: None,
             keyboard_layout_synced: false,
         };
@@ -132,9 +147,66 @@ impl Capture {
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
     ) {
-        let pos = to_capture_pos(pos);
+        let point = CapturePoint::directional(to_capture_pos(pos));
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(handle, vec![point], capture_type))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn create_points(
+        &self,
+        handle: CaptureHandle,
+        points: Vec<CapturePoint>,
+        capture_type: CaptureType,
+    ) {
+        self.request_tx
+            .send(CaptureRequest::Create(handle, points, capture_type))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn replace_points(
+        &self,
+        handle: CaptureHandle,
+        points: Vec<CapturePoint>,
+        capture_type: CaptureType,
+    ) {
+        self.destroy(handle);
+        self.create_points(handle, points, capture_type);
+    }
+
+    pub(crate) fn create_monitor(
+        &self,
+        handle: CaptureHandle,
+        monitor_id: input_event::MonitorId,
+        edge: lan_mouse_ipc::Position,
+        capture_type: CaptureType,
+    ) {
+        let edge = to_capture_pos(edge);
+        self.create_points(
+            handle,
+            vec![CapturePoint {
+                monitor_id: Some(monitor_id),
+                edge,
+            }],
+            capture_type,
+        );
+    }
+
+    pub(crate) fn discover_monitors(&self, handle: CaptureHandle) {
+        self.request_tx
+            .send(CaptureRequest::DiscoverMonitors(handle))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn send_proto(&self, handle: CaptureHandle, event: ProtoEvent) {
+        self.request_tx
+            .send(CaptureRequest::SendProto(handle, event))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn set_monitor_grid(&self, grid: Option<MonitorGrid>, local_fingerprint: String) {
+        self.request_tx
+            .send(CaptureRequest::SetMonitorGrid(grid, local_fingerprint))
             .expect("channel closed");
     }
 
@@ -196,37 +268,36 @@ struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<(CaptureHandle, Vec<CapturePoint>, CaptureType)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    monitor_grid: Option<MonitorGrid>,
+    local_fingerprint: String,
     last_keyboard_layout: Option<lan_mouse_proto::KeyboardLayout>,
     keyboard_layout_synced: bool,
 }
 
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(
+        &mut self,
+        handle: CaptureHandle,
+        points: Vec<CapturePoint>,
+        capture_type: CaptureType,
+    ) {
+        self.captures.push((handle, points, capture_type));
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
     }
 
-    fn is_default_capture_at(&self, pos: Position) -> bool {
+    fn is_default_capture_at(&self, point: &CapturePoint) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
-    }
-
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
+            .any(|(_, points, t)| points.contains(point) && *t == CaptureType::Default)
     }
 
     fn get_type(&self, handle: CaptureHandle) -> CaptureType {
@@ -258,12 +329,38 @@ impl CaptureTask {
                         CaptureRequest::CancelClipboardTransfers => {
                             self.conn.cancel_clipboard_transfers().await;
                         }
+                        CaptureRequest::DiscoverMonitors(handle) => {
+                            if let Err(error) = self.conn.send(ProtoEvent::MonitorCatalogRequest, handle).await {
+                                log::debug!("monitor discovery request for {handle} is queued by connection setup: {error}");
+                            }
+                        }
+                        CaptureRequest::SendProto(handle, event) => {
+                            if let Err(error) = self.conn.send(event, handle).await {
+                                log::debug!("monitor protocol send to {handle} failed: {error}");
+                            }
+                        }
+                        CaptureRequest::SetMonitorGrid(grid, fingerprint) => {
+                            self.monitor_grid = grid;
+                            self.local_fingerprint = fingerprint;
+                        }
                     },
                     (handle, event) = self.conn.recv() => {
-                        if let NetworkEvent::Clipboard { update_id, payload } = event {
-                            self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
-                        } else {
-                            log::trace!("ignoring non-clipboard network event from {handle} while input capture is unavailable");
+                        match event {
+                            NetworkEvent::Clipboard { update_id, payload } => {
+                                self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
+                            }
+                            NetworkEvent::Connected => {
+                                self.event_tx.send(ICaptureEvent::PeerConnected(handle)).expect("channel closed");
+                            }
+                            NetworkEvent::Disconnected => {
+                                self.event_tx.send(ICaptureEvent::PeerDisconnected(handle)).expect("channel closed");
+                            }
+                            NetworkEvent::PeerStatus => {
+                                self.event_tx.send(ICaptureEvent::PeerStatus(handle)).expect("channel closed");
+                            }
+                            NetworkEvent::Proto(event) => {
+                                self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed");
+                            }
                         }
                     }
                     _ = self.cancellation_token.cancelled() => return,
@@ -278,6 +375,12 @@ impl CaptureTask {
             r = InputCapture::new(self.backend) => r?,
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
+
+        self.event_tx
+            .send(ICaptureEvent::LocalMonitorCatalog(
+                capture.monitor_catalog(),
+            ))
+            .expect("channel closed");
 
         let _capture_guard = DropGuard::new(
             self.event_tx.clone(),
@@ -302,9 +405,9 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, points, _type) in captures {
             tokio::select! {
-                r = capture.create(handle, pos) => r?,
+                r = capture.create(handle, points) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -325,6 +428,18 @@ impl CaptureTask {
                     let event = match event {
                         NetworkEvent::Clipboard { update_id, payload } => {
                             self.event_tx.send(ICaptureEvent::Clipboard { update_id, payload }).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::Connected => {
+                            self.event_tx.send(ICaptureEvent::PeerConnected(handle)).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::Disconnected => {
+                            self.event_tx.send(ICaptureEvent::PeerDisconnected(handle)).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::PeerStatus => {
+                            self.event_tx.send(ICaptureEvent::PeerStatus(handle)).expect("channel closed");
                             continue;
                         }
                         NetworkEvent::Proto(event) => event,
@@ -348,14 +463,14 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
-                        _ => {}
+                        event => self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed"),
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
+                        self.add_capture(h, p.clone(), t);
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
@@ -375,6 +490,20 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::DiscoverMonitors(handle) => {
+                        if let Err(error) = self.conn.send(ProtoEvent::MonitorCatalogRequest, handle).await {
+                            log::debug!("monitor discovery request for {handle} is queued by connection setup: {error}");
+                        }
+                    }
+                    CaptureRequest::SendProto(handle, event) => {
+                        if let Err(error) = self.conn.send(event, handle).await {
+                            log::debug!("monitor protocol send to {handle} failed: {error}");
+                        }
+                    }
+                    CaptureRequest::SetMonitorGrid(grid, fingerprint) => {
+                        self.monitor_grid = grid;
+                        self.local_fingerprint = fingerprint;
+                    }
                     CaptureRequest::Clipboard { update_id, payload } => {
                         self.conn.broadcast_clipboard(update_id, payload).await;
                     }
@@ -391,9 +520,9 @@ impl CaptureTask {
     async fn handle_capture_event(
         &mut self,
         capture: &mut InputCapture,
-        event: (CaptureHandle, CaptureEvent),
+        event: (CaptureHandle, CapturePoint, CaptureEvent),
     ) -> Result<(), CaptureError> {
-        let (handle, event) = event;
+        let (handle, point, event) = event;
         log::trace!("({handle}): {event:?}");
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
@@ -411,7 +540,7 @@ impl CaptureTask {
         if self.get_type(handle) == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(&point) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -420,6 +549,32 @@ impl CaptureTask {
         }
 
         let is_begin = event == CaptureEvent::Begin;
+        let monitor_enter = if let Some(source_monitor) = point.monitor_id.as_ref() {
+            self.monitor_grid.as_ref().and_then(|grid| {
+                let target = crate::monitor_grid::route(
+                    grid,
+                    &self.local_fingerprint,
+                    source_monitor,
+                    to_ipc_pos(point.edge),
+                )?;
+                if self.conn.peer_fingerprint(handle).as_deref()
+                    != Some(target.owner_fingerprint.as_str())
+                    || !self.conn.supports_monitor_grid(handle)
+                {
+                    return None;
+                }
+                Some(ProtoEvent::EnterMonitor {
+                    monitor_id: target.monitor_id,
+                    edge: to_proto_pos(point.edge.opposite()),
+                })
+            })
+        } else {
+            None
+        };
+        if is_begin && point.monitor_id.is_some() && monitor_enter.is_none() {
+            log::info!("releasing capture: monitor grid destination is unavailable");
+            return capture.release().await;
+        }
 
         // activated a new client
         if is_begin && Some(handle) != self.active_client {
@@ -432,7 +587,7 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(point.edge.opposite());
 
         // The layout event must precede Enter and the first key. While waiting
         // for Enter's acknowledgment, repeat it because an initial send can
@@ -465,10 +620,12 @@ impl CaptureTask {
         }
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin => monitor_enter
+                .clone()
+                .unwrap_or(ProtoEvent::Enter(opposite_pos)),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
+                State::WaitingForAck => monitor_enter.unwrap_or(ProtoEvent::Enter(opposite_pos)),
                 State::Sending => ProtoEvent::Input(e),
             },
         };
@@ -558,6 +715,15 @@ fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
         lan_mouse_ipc::Position::Right => input_capture::Position::Right,
         lan_mouse_ipc::Position::Top => input_capture::Position::Top,
         lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
+    }
+}
+
+fn to_ipc_pos(pos: input_capture::Position) -> lan_mouse_ipc::Position {
+    match pos {
+        input_capture::Position::Left => lan_mouse_ipc::Position::Left,
+        input_capture::Position::Right => lan_mouse_ipc::Position::Right,
+        input_capture::Position::Top => lan_mouse_ipc::Position::Top,
+        input_capture::Position::Bottom => lan_mouse_ipc::Position::Bottom,
     }
 }
 

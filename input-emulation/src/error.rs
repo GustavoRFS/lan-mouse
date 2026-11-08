@@ -22,6 +22,8 @@ use wayland_client::{
 pub enum EmulationError {
     #[error("event stream closed")]
     EndOfStream,
+    #[error("monitor entry failed: {0}")]
+    MonitorEntry(String),
     #[cfg(libei)]
     #[error("libei error: `{0}`")]
     Libei(#[from] reis::Error),

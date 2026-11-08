@@ -2,6 +2,7 @@ use crate::config::local_commit;
 use crate::{
     client::ClientManager,
     clipboard::{ClipboardPayload, ClipboardPeer, SharedClipboardReassembler},
+    crypto,
 };
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{
@@ -58,6 +59,9 @@ struct ClientConnection {
 }
 
 pub(crate) enum NetworkEvent {
+    Connected,
+    Disconnected,
+    PeerStatus,
     Proto(ProtoEvent),
     Clipboard {
         update_id: ClipboardUpdateId,
@@ -150,6 +154,16 @@ impl LanMouseConnection {
 
     pub(crate) fn keyboard_layout(&self, handle: ClientHandle) -> Option<String> {
         self.client_manager.get_keyboard_layout(handle)
+    }
+
+    pub(crate) fn peer_fingerprint(&self, handle: ClientHandle) -> Option<String> {
+        self.client_manager
+            .get_state(handle)
+            .and_then(|(_, state)| state.peer_fingerprint)
+    }
+
+    pub(crate) fn supports_monitor_grid(&self, handle: ClientHandle) -> bool {
+        self.client_manager.supports_monitor_grid(handle)
     }
 
     pub(crate) async fn broadcast_clipboard(
@@ -264,6 +278,16 @@ async fn connect_to_handle(
         };
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
+        let peer_fingerprint = if let Some(dtls) = conn.as_any().downcast_ref::<DTLSConn>() {
+            dtls.connection_state()
+                .await
+                .peer_certificates
+                .first()
+                .map(|certificate| crypto::generate_fingerprint(certificate))
+        } else {
+            None
+        };
+        client_manager.set_peer_fingerprint(handle, peer_fingerprint);
         let clipboard = Arc::new(ClipboardPeer::new(conn.clone(), addr, reassembler));
         clipboard.advertise().await;
         conns.lock().await.insert(
@@ -280,13 +304,24 @@ async fn connect_to_handle(
         // mirrors a Hello back so the receive loop can populate
         // `peer_commit`. Old peers will silently skip this event
         // per the forward-compat handler in [`receive_loop`].
-        let (buf, len) = ProtoEvent::Hello {
-            commit: local_commit(),
+        for event in [
+            ProtoEvent::Hello {
+                commit: local_commit(),
+            },
+            ProtoEvent::MonitorGridCapabilities { version: 1 },
+            ProtoEvent::MonitorCatalogRequest,
+        ] {
+            match event.encode() {
+                Ok((buf, len)) => {
+                    if let Err(error) = conn.send(&buf[..len]).await {
+                        log::debug!("initial event to {addr} failed: {error}");
+                    }
+                }
+                Err(error) => log::warn!("failed to encode initial event for {addr}: {error}"),
+            }
         }
-        .into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("hello send to {addr} failed: {e}");
-        }
+        tx.send((handle, NetworkEvent::Connected))
+            .expect("channel closed");
 
         // poll connection for active
         spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
@@ -372,9 +407,16 @@ async fn receive_loop(
                         client_manager.set_active_addr(handle, Some(addr));
                         client_manager.set_alive(handle, b);
                         ping_response.borrow_mut().insert(addr);
+                        tx.send((handle, NetworkEvent::PeerStatus))
+                            .expect("channel closed");
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
+                    }
+                    ProtoEvent::MonitorGridCapabilities { version } => {
+                        client_manager.set_monitor_grid_version(handle, Some(version));
+                        tx.send((handle, NetworkEvent::Proto(event)))
+                            .expect("channel closed");
                     }
                     event => tx
                         .send((handle, NetworkEvent::Proto(event)))
@@ -389,6 +431,8 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
+    tx.send((handle, NetworkEvent::Disconnected))
+        .expect("channel closed");
     disconnect(&client_manager, handle, addr, &conns).await;
 }
 
@@ -402,6 +446,9 @@ async fn disconnect(
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    client_manager.set_peer_fingerprint(handle, None);
+    client_manager.set_monitor_grid_version(handle, None);
+    client_manager.set_alive(handle, false);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

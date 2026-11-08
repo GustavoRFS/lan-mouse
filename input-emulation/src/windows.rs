@@ -1,23 +1,34 @@
 use super::error::{EmulationError, WindowsEmulationCreationError};
+use super::monitor_position::{MonitorGeometry, resolve_entry_midpoint};
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, MonitorId,
+    PointerEvent, scancode,
 };
+use lan_mouse_ipc::Position;
 
 use async_trait::async_trait;
 use std::ops::BitOrAssign;
 use std::time::Duration;
 use tokio::task::AbortHandle;
+use windows::Win32::Foundation::FALSE;
+use windows::Win32::Graphics::Gdi::{
+    DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
+    EnumDisplayDevicesW, EnumDisplaySettingsW,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EDD_GET_DEVICE_INTERFACE_NAME, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+};
+use windows::core::PCWSTR;
 
 use super::{Emulation, EmulationHandle};
 
@@ -80,6 +91,121 @@ impl Emulation for WindowsEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    async fn enter_monitor(
+        &mut self,
+        _handle: super::EmulationHandle,
+        monitor_id: &MonitorId,
+        edge: Position,
+    ) -> Result<(), EmulationError> {
+        let displays = enumerate_outputs();
+        let target = resolve_entry_midpoint(&displays, monitor_id, edge)
+            .map_err(|error| EmulationError::MonitorEntry(error.to_string()))?;
+        let virtual_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let virtual_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if virtual_width <= 0 || virtual_height <= 0 {
+            return Err(EmulationError::MonitorEntry(
+                "Windows reported an invalid virtual desktop size".to_owned(),
+            ));
+        }
+        let dx = normalize_virtual_coordinate(target.x, virtual_x, virtual_width);
+        let dy = normalize_virtual_coordinate(target.y, virtual_y, virtual_height);
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if sent == 0 {
+            return Err(EmulationError::MonitorEntry(
+                "Windows SendInput rejected absolute monitor entry".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn normalize_virtual_coordinate(value: i32, origin: i32, extent: i32) -> i32 {
+    if extent <= 1 {
+        return 0;
+    }
+    let relative = i64::from(value) - i64::from(origin);
+    ((relative.clamp(0, i64::from(extent - 1)) * 65_535) / i64::from(extent - 1)) as i32
+}
+
+fn enumerate_outputs() -> Vec<MonitorGeometry> {
+    let mut displays = Vec::new();
+    unsafe {
+        for index in 0.. {
+            let mut display: DISPLAY_DEVICEW = std::mem::zeroed();
+            display.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if EnumDisplayDevicesW(None, index, &mut display, EDD_GET_DEVICE_INTERFACE_NAME)
+                == FALSE
+            {
+                break;
+            }
+            if !display
+                .StateFlags
+                .contains(DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+            {
+                continue;
+            }
+            let mut monitor: DISPLAY_DEVICEW = std::mem::zeroed();
+            monitor.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            let monitor_found = EnumDisplayDevicesW(
+                PCWSTR::from_raw(display.DeviceName.as_ptr()),
+                0,
+                &mut monitor,
+                EDD_GET_DEVICE_INTERFACE_NAME,
+            ) != FALSE;
+            let device_name = wide_string(&display.DeviceName);
+            let id = if monitor_found {
+                let device_id = wide_string(&monitor.DeviceID);
+                MonitorId::new(device_id).or_else(|_| MonitorId::new(device_name.clone()))
+            } else {
+                MonitorId::new(device_name.clone())
+            };
+            let Ok(id) = id else { continue };
+
+            let mut mode: DEVMODEW = std::mem::zeroed();
+            mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+            if EnumDisplaySettingsW(
+                PCWSTR::from_raw(display.DeviceName.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut mode,
+            ) == FALSE
+            {
+                continue;
+            }
+            let position = mode.Anonymous1.Anonymous2.dmPosition;
+            displays.push(MonitorGeometry {
+                id,
+                x: position.x,
+                y: position.y,
+                width: mode.dmPelsWidth,
+                height: mode.dmPelsHeight,
+            });
+        }
+    }
+    displays
+}
+
+fn wide_string(value: &[u16]) -> String {
+    let end = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..end])
 }
 
 impl WindowsEmulation {

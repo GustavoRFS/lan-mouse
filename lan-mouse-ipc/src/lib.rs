@@ -12,10 +12,13 @@ use thiserror::Error;
 #[cfg(unix)]
 use std::{env, path::Path};
 
+use input_event::MonitorDescriptor;
 use serde::{Deserialize, Serialize};
 
 mod monitor_grid;
-pub use monitor_grid::{GridPosition, MonitorGrid, MonitorGridEntry, MonitorGridError};
+pub use monitor_grid::{
+    GridPosition, MAX_MONITOR_GRID_ENTRIES, MonitorGrid, MonitorGridEntry, MonitorGridError,
+};
 
 mod connect;
 mod connect_async;
@@ -214,6 +217,10 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    /// authenticated peer certificate fingerprint, when known
+    pub peer_fingerprint: Option<String>,
+    /// monitor-grid protocol version advertised by the peer
+    pub monitor_grid_version: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +275,15 @@ pub enum FrontendEvent {
     ClipboardFileOffer {
         update_id: [u8; 16],
         offer: RemoteFileOffer,
+    },
+    /// currently saved monitor arrangement
+    MonitorGridUpdated(MonitorGrid),
+    /// displays connected to this machine
+    LocalMonitorCatalog(Vec<MonitorDescriptor>),
+    /// displays currently discovered on an authenticated remote peer
+    RemoteMonitorCatalog {
+        owner_fingerprint: String,
+        monitors: Vec<MonitorDescriptor>,
     },
 }
 
@@ -338,6 +354,10 @@ pub enum FrontendRequest {
     ClipboardImage(String),
     /// Files or folders copied on this device. Peers fetch them on paste.
     ClipboardFiles(Vec<PathBuf>),
+    /// connect to a peer and request its current display catalog
+    DiscoverMonitors(ClientHandle),
+    /// save and synchronize a per-monitor arrangement
+    UpdateMonitorGrid(MonitorGrid),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

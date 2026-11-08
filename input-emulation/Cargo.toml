@@ -19,6 +19,7 @@ async-trait = "0.1.80"
 futures = "0.3.28"
 log = "0.4.22"
 input-event = { path = "../input-event", version = "0.4.0" }
+lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.5.0" }
 thiserror = "2.0.0"
 tokio = { version = "1.32.0", features = [
     "io-util",
