@@ -69,6 +69,19 @@ impl Display for Backend {
     }
 }
 
+/// Backend settings that do not depend on the platform's own input configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmulationOptions {
+    /// xkb layout (and variant) of the virtual keyboard, instead of the compositor's.
+    ///
+    /// Only the wlroots backend creates a keyboard with a keymap of its own. It sends the
+    /// compositor's keymap as it was at startup, which never follows later layout changes, and
+    /// resets the layout group on every modifier key, so a remote keyboard whose layout differs
+    /// from the local one types the wrong characters. A fixed layout is group 0 and stays put.
+    pub keyboard_layout: Option<String>,
+    pub keyboard_variant: Option<String>,
+}
+
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
@@ -76,10 +89,14 @@ pub struct InputEmulation {
 }
 
 impl InputEmulation {
-    async fn with_backend(backend: Backend) -> Result<InputEmulation, EmulationCreationError> {
+    #[cfg_attr(not(wlroots), allow(unused_variables))]
+    async fn with_backend(
+        backend: Backend,
+        options: &EmulationOptions,
+    ) -> Result<InputEmulation, EmulationCreationError> {
         let emulation: Box<dyn Emulation> = match backend {
             #[cfg(wlroots)]
-            Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new()?),
+            Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new(options)?),
             #[cfg(libei)]
             Backend::Libei => Box::new(libei::LibeiEmulation::new().await?),
             #[cfg(x11)]
@@ -99,9 +116,12 @@ impl InputEmulation {
         })
     }
 
-    pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
+    pub async fn new(
+        backend: Option<Backend>,
+        options: EmulationOptions,
+    ) -> Result<InputEmulation, EmulationCreationError> {
         if let Some(backend) = backend {
-            let b = Self::with_backend(backend).await;
+            let b = Self::with_backend(backend, &options).await;
             if b.is_ok() {
                 log::info!("using emulation backend: {backend}");
             }
@@ -123,7 +143,7 @@ impl InputEmulation {
             Backend::MacOs,
             Backend::Dummy,
         ] {
-            match Self::with_backend(backend).await {
+            match Self::with_backend(backend, &options).await {
                 Ok(b) => {
                     log::info!("using emulation backend: {backend}");
                     return Ok(b);

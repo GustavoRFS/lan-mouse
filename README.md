@@ -414,6 +414,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# optional xkb layout of the virtual keyboard (wlroots emulation only), see below
+# keyboard_layout = "es"
+# keyboard_variant = ""
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
@@ -443,6 +447,28 @@ port = 4242
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
+
+### Keyboard layout of the receiving side (wlroots)
+Lan Mouse forwards key *positions*, so the receiving machine decides which character each
+key types. On wlroots compositors (Hyprland, Sway, ...) the virtual keyboard it creates carries
+a keymap of its own: by default a copy of the compositor's keymap taken **once, at startup**. It
+does not follow later changes to the compositor's layouts, and every modifier key (Shift, Ctrl,
+Alt, ...) switches it back to the first layout. When the sending device's keyboard has a
+different layout than this one, for instance a Spanish keyboard in front of a `br` desktop,
+`ñ` comes out as `ç` and so on, and switching layouts on the receiving desktop changes nothing.
+
+Set the layout of the *sending* keyboard to fix that:
+
+```toml
+keyboard_layout = "es"
+# keyboard_variant = "dvorak"   # optional
+```
+
+The names are the ones from `xkbcli list` (the `layout` and `variant` fields). The virtual keyboard
+then has only that layout, so it never changes, whatever the receiving desktop is set to.
+It applies to every connected device, as they share the one virtual keyboard. A layout
+xkb does not know is logged as an error and the compositor's keymap is used instead.
+This option is only used by the `wlroots` emulation backend.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
