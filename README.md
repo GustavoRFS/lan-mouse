@@ -450,6 +450,32 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
+### Per-monitor layout
+
+Open **Arrange monitors** from the main window menu to see the local displays and arrange displays from a compatible peer. Local displays start in their operating-system arrangement. Choose a peer and select **Discover displays** to request its output list over the authenticated connection. Remote displays appear as individual tiles; drag a tile to an empty cell to move it. A cell represents one display regardless of its resolution, so crossing between machines enters at the midpoint of the selected display edge instead of matching pixel offsets.
+
+The layout is saved in the top-level `monitor_grid` section of `config.toml` and synchronized with compatible peers. Disconnected or unplugged displays remain in the saved grid as unavailable and are not used for routing until they appear in a fresh display catalog. The existing per-client `position` setting remains available for peers without monitor-grid support; those peers keep the original left/right/top/bottom behavior.
+
+The editor writes entries in this form; fingerprints and monitor IDs come from the authenticated peer and its display catalog:
+
+```toml
+[monitor_grid]
+revision = 3
+origin_fingerprint = "local-certificate-fingerprint"
+
+[[monitor_grid.entries]]
+owner_fingerprint = "local-certificate-fingerprint"
+monitor_id = "local-display-id"
+position = { x = 0, y = 0 }
+
+[[monitor_grid.entries]]
+owner_fingerprint = "peer-certificate-fingerprint"
+monitor_id = "DP-1"
+position = { x = 1, y = 0 }
+```
+
+Per-monitor capture and entry placement are supported on Windows and on Hyprland with layer-shell capture and wlroots emulation. Other capture backends continue to use the legacy directional selector.
+
 ### Keyboard layout when sending to a wlroots computer
 Lan Mouse forwards key *positions*, so the receiving machine decides which character each key
 types. Expand a client in the GTK window and choose **keyboard layout**. The choice is saved for

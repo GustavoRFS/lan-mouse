@@ -19,6 +19,14 @@ graph TD
     G -->|Windows Event| J[Windows Backend]
 ```
 
+## Per-monitor grid routing
+
+Windows and Hyprland's layer-shell capture identify the physical output and the edge the pointer crossed. The service pairs that output ID with the authenticated device certificate fingerprint, then looks up the neighboring cell in the saved `monitor_grid`. Native transitions between local outputs stay with the operating system. An edge whose neighboring cell belongs to another device sends a monitor-aware enter event; the receiving Windows or wlroots backend places its virtual pointer at the midpoint of the requested edge.
+
+Grid cells are equal logical units. The routing protocol does not scale or align pixel coordinates, so outputs with different resolutions can be arranged together. The GTK **Arrange monitors** window discovers a peer's outputs, allows its remote tiles to be moved, and saves the snapshot to the top-level `monitor_grid` TOML section. Grid snapshots are authenticated, versioned, acknowledged, retried, and replayed after reconnection. Missing or disconnected outputs stay in the layout but are excluded from active routes until rediscovered.
+
+Peers that do not advertise monitor-grid support keep using the legacy per-client `Position` setting and `Enter(Position)` event. Capture backends without named monitor edges also retain the directional behavior.
+
 ### Input
 The input component is responsible for translating inputs from a given backend
 to a standardized format and passing them to the event emitter.

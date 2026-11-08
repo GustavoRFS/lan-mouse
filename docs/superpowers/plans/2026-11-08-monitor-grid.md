@@ -149,11 +149,13 @@ Owning checks: `route_uses_exact_source_monitor_and_edge`, `entry_midpoint_uses_
 - Add **Discover displays** for a selected client; show connection/discovery progress and keep saved remote outputs visible but unavailable while disconnected.
 - Dragging a remote tile updates its `GridPosition` and sends `UpdateMonitorGrid`; the window reflects the acknowledged revision and preserves the legacy position selector for peers without grid support.
 
-- [ ] Add a GTK model test for moving a remote tile, preventing occupied-cell collisions, and retaining unavailable outputs.
-- [ ] Run the GTK model test on Windows and `gauss`; confirm it fails because the editor model is missing.
-- [ ] Implement the grid window, drag/drop, discovery action, IPC event updates, and save/ack state.
-- [ ] Run `cargo check -p lan-mouse-gtk` and the app's GTK tests on Windows and `gauss`; inspect the window on both hosts when their graphical sessions are available.
-- [ ] Commit as `feat: add monitor grid editor`.
+- [x] Add a GTK model test for moving a remote tile, preventing occupied-cell collisions, and retaining unavailable outputs.
+- [x] Run the GTK model test on Windows and `gauss`; confirm it fails because the editor model is missing.
+- [x] Implement the grid window, drag/drop, discovery action, IPC event updates, and save/ack state.
+- [x] Run `cargo check -p lan-mouse-gtk` and the app's GTK tests on Windows and `gauss`; inspect the window on both hosts when their graphical sessions are available.
+- [x] Commit as `feat: add monitor grid editor`.
+
+Windows GTK checks are blocked before Rust compilation by unavailable `pkg-config` and native GTK/Pango development packages. The GTK model tests and Clippy passed on Gauss. Neither SSH session has a graphical display, so the window could not be visually inspected.
 
 ### Task 5: Public documentation and final verification
 
@@ -161,8 +163,10 @@ Owning checks: `route_uses_exact_source_monitor_and_edge`, `entry_midpoint_uses_
 - Modify: `README.md`
 - Modify: `DOC.md`
 
-- [ ] Document the editor, per-monitor output discovery, equal-cell edge handoff, legacy-peer fallback, and the new TOML layout.
-- [ ] Run `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features`, and affected workspace tests on Windows and `gauss`.
-- [ ] Build the Windows workspace here and the Linux workspace on `gauss`; record any platform prerequisites that are unavailable.
+- [x] Document the editor, per-monitor output discovery, equal-cell edge handoff, legacy-peer fallback, and the new TOML layout.
+- [x] Run `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features`, and affected workspace tests on Windows and `gauss`.
+- [x] Build the Windows workspace here and the Linux workspace on `gauss`; record any platform prerequisites that are unavailable.
 - [ ] Review the full diff for protocol compatibility, stale-output handling, documentation accuracy, and any changes outside this feature.
 - [ ] Commit as `docs: explain monitor grid configuration`.
+
+Verification results: the full Linux workspace build on Gauss passed. The Windows app target without GTK passed; the Windows full workspace build and GTK tests stop at missing `pkg-config` and native GTK/Pango development dependencies. Full workspace Clippy on Gauss is blocked by the pre-existing `input-emulation/examples/double_click.rs` constructor call; Windows workspace Clippy is blocked by the same GTK prerequisites. Workspace `cargo fmt --check` reports only the pre-existing formatting in `lan-mouse-gtk/src/linux_tray.rs`; all Rust files changed for this feature pass targeted rustfmt checks. Affected tests pass on both hosts, with the GTK model test running on Gauss.
