@@ -1,6 +1,9 @@
 mod buffer;
 mod codec;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 pub use buffer::{PLAYOUT_FRAMES_PER_TRACK, PlayoutBuffer};
 pub use codec::{AudioDecoder, AudioEncoder};
 pub use lan_mouse_ipc::{AudioDevice, AudioDeviceDirection};

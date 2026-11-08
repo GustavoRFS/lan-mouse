@@ -6,6 +6,7 @@ pub const PLAYOUT_FRAMES_PER_TRACK: usize = 4;
 
 /// A fixed-capacity playout queue that tracks ordering independently per track.
 /// When full, it discards the oldest frame to keep latency bounded.
+#[derive(Default)]
 pub struct PlayoutBuffer {
     system: TrackBuffer,
     microphone: TrackBuffer,
@@ -15,15 +16,6 @@ pub struct PlayoutBuffer {
 struct TrackBuffer {
     frames: VecDeque<PcmFrame>,
     latest_sequence: Option<u32>,
-}
-
-impl Default for PlayoutBuffer {
-    fn default() -> Self {
-        Self {
-            system: TrackBuffer::default(),
-            microphone: TrackBuffer::default(),
-        }
-    }
 }
 
 impl PlayoutBuffer {
