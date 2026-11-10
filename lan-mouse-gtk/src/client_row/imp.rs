@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use adw::subclass::prelude::*;
 use adw::{ActionRow, ComboRow, prelude::*};
@@ -6,9 +6,12 @@ use glib::{Binding, subclass::InitializingObject};
 use gtk::glib::subclass::Signal;
 use gtk::glib::{SignalHandlerId, clone};
 use gtk::{Button, CompositeTemplate, Entry, Switch, glib};
-use lan_mouse_ipc::Position;
+use lan_mouse_ipc::{
+    AudioConfig, AudioDevice, AudioDeviceDirection, AudioMode, AudioPeerStatus, Position,
+};
 use std::sync::OnceLock;
 
+use crate::audio_settings::audio_settings_visibility;
 use crate::client_object::ClientObject;
 
 #[derive(CompositeTemplate, Default)]
@@ -32,6 +35,28 @@ pub struct ClientRow {
     pub delete_button: TemplateChild<gtk::Button>,
     #[template_child]
     pub dns_loading_indicator: TemplateChild<gtk::Spinner>,
+    #[template_child]
+    pub audio_mode: TemplateChild<ComboRow>,
+    #[template_child]
+    pub send_system_audio_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub send_system_audio_switch: TemplateChild<Switch>,
+    #[template_child]
+    pub system_capture_device: TemplateChild<ComboRow>,
+    #[template_child]
+    pub send_microphone_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub send_microphone_switch: TemplateChild<Switch>,
+    #[template_child]
+    pub microphone_capture_device: TemplateChild<ComboRow>,
+    #[template_child]
+    pub playback_device: TemplateChild<ComboRow>,
+    #[template_child]
+    pub receive_microphone_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub receive_microphone_switch: TemplateChild<Switch>,
+    #[template_child]
+    pub audio_status_row: TemplateChild<ActionRow>,
     pub bindings: RefCell<Vec<Binding>>,
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,
@@ -39,6 +64,12 @@ pub struct ClientRow {
     keyboard_layout_change_handler: RefCell<Option<SignalHandlerId>>,
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub client_object: RefCell<Option<ClientObject>>,
+    pub(super) audio_config: RefCell<AudioConfig>,
+    audio_devices: RefCell<Vec<AudioDevice>>,
+    system_device_ids: RefCell<Vec<Option<String>>>,
+    microphone_device_ids: RefCell<Vec<Option<String>>>,
+    playback_device_ids: RefCell<Vec<Option<String>>>,
+    applying_audio_state: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -113,6 +144,55 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.set_state_handler.replace(Some(handler));
+
+        self.audio_mode.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| row.handle_audio_mode_changed()
+        ));
+        self.send_system_audio_switch.connect_active_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |switch| row.update_audio_bool(
+                |config| config.send_system_audio,
+                |config, value| config.send_system_audio = value,
+                switch.is_active()
+            )
+        ));
+        self.send_microphone_switch.connect_active_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |switch| row.update_audio_bool(
+                |config| config.send_microphone,
+                |config, value| config.send_microphone = value,
+                switch.is_active()
+            )
+        ));
+        self.receive_microphone_switch.connect_active_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |switch| row.update_audio_bool(
+                |config| config.receive_microphone,
+                |config, value| config.receive_microphone = value,
+                switch.is_active()
+            )
+        ));
+        self.system_capture_device.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |combo| row.update_audio_device(0, combo.selected())
+        ));
+        self.microphone_capture_device
+            .connect_selected_notify(clone!(
+                #[weak(rename_to = row)]
+                self,
+                move |combo| row.update_audio_device(1, combo.selected())
+            ));
+        self.playback_device.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |combo| row.update_audio_device(2, combo.selected())
+        ));
     }
 
     fn signals() -> &'static [glib::subclass::Signal] {
@@ -136,6 +216,7 @@ impl ObjectImpl for ClientRow {
                 Signal::builder("request-keyboard-layout-change")
                     .param_types([String::static_type()])
                     .build(),
+                Signal::builder("request-audio-config").build(),
             ]
         })
     }
@@ -186,6 +267,205 @@ impl ClientRow {
         .to_string();
         self.obj()
             .emit_by_name::<()>("request-keyboard-layout-change", &[&layout]);
+    }
+
+    fn handle_audio_mode_changed(&self) {
+        if self.applying_audio_state.get() {
+            return;
+        }
+        let mode = match self.audio_mode.selected() {
+            1 => AudioMode::Send,
+            2 => AudioMode::Receive,
+            _ => AudioMode::Off,
+        };
+        if self.audio_config.borrow().mode == mode {
+            return;
+        }
+        self.audio_config.borrow_mut().mode = mode;
+        self.update_audio_visibility();
+        self.emit_audio_config_request();
+    }
+
+    fn update_audio_bool(
+        &self,
+        get_value: impl Fn(&AudioConfig) -> bool,
+        set_value: impl Fn(&mut AudioConfig, bool),
+        value: bool,
+    ) {
+        if self.applying_audio_state.get() {
+            return;
+        }
+        let mut config = self.audio_config.borrow_mut();
+        if get_value(&config) == value {
+            return;
+        }
+        set_value(&mut config, value);
+        drop(config);
+        self.update_audio_visibility();
+        self.emit_audio_config_request();
+    }
+
+    fn update_audio_device(&self, device: usize, index: u32) {
+        if self.applying_audio_state.get() {
+            return;
+        }
+        let selected = match device {
+            0 => self.system_device_ids.borrow().get(index as usize).cloned(),
+            1 => self
+                .microphone_device_ids
+                .borrow()
+                .get(index as usize)
+                .cloned(),
+            _ => self
+                .playback_device_ids
+                .borrow()
+                .get(index as usize)
+                .cloned(),
+        };
+        let Some(selected) = selected else {
+            return;
+        };
+        let mut config = self.audio_config.borrow_mut();
+        let current = match device {
+            0 => &mut config.system_capture_device,
+            1 => &mut config.microphone_capture_device,
+            _ => &mut config.playback_device,
+        };
+        if *current == selected {
+            return;
+        }
+        *current = selected;
+        drop(config);
+        self.emit_audio_config_request();
+    }
+
+    fn emit_audio_config_request(&self) {
+        self.obj().emit_by_name::<()>("request-audio-config", &[]);
+    }
+
+    fn update_audio_visibility(&self) {
+        let config = self.audio_config.borrow();
+        let visibility = audio_settings_visibility(config.mode);
+        self.send_system_audio_row
+            .set_visible(visibility.send_system_audio);
+        self.system_capture_device
+            .set_visible(visibility.system_capture_device && config.send_system_audio);
+        self.send_microphone_row
+            .set_visible(visibility.send_microphone);
+        self.microphone_capture_device
+            .set_visible(visibility.microphone_capture_device && config.send_microphone);
+        self.playback_device.set_visible(visibility.playback_device);
+        self.receive_microphone_row
+            .set_visible(visibility.receive_microphone);
+    }
+
+    fn rebuild_device_combo(
+        &self,
+        combo: &ComboRow,
+        direction: AudioDeviceDirection,
+        selected: Option<&str>,
+        ids: &RefCell<Vec<Option<String>>>,
+    ) {
+        let mut labels = vec!["Primeiro disponível".to_owned()];
+        let mut values = vec![None];
+        for device in self
+            .audio_devices
+            .borrow()
+            .iter()
+            .filter(|device| device.direction == direction)
+        {
+            labels.push(device.name.clone());
+            values.push(Some(device.id.clone()));
+        }
+        if let Some(selected) = selected {
+            if !values.iter().flatten().any(|id| id == selected) {
+                labels.push(format!("{selected} (indisponível)"));
+                values.push(Some(selected.to_owned()));
+            }
+        }
+        let selected_index = selected
+            .and_then(|id| values.iter().position(|value| value.as_deref() == Some(id)))
+            .unwrap_or(0) as u32;
+        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let model = gtk::StringList::new(&label_refs);
+        ids.replace(values);
+        combo.set_model(Some(&model));
+        combo.set_selected(selected_index);
+    }
+
+    pub(super) fn apply_audio_config(&self, config: AudioConfig) {
+        self.applying_audio_state.set(true);
+        self.audio_config.replace(config.clone());
+        self.audio_mode.set_selected(match config.mode {
+            AudioMode::Off => 0,
+            AudioMode::Send => 1,
+            AudioMode::Receive => 2,
+        });
+        self.send_system_audio_switch
+            .set_active(config.send_system_audio);
+        self.send_microphone_switch
+            .set_active(config.send_microphone);
+        self.receive_microphone_switch
+            .set_active(config.receive_microphone);
+        self.rebuild_device_combo(
+            &self.system_capture_device,
+            AudioDeviceDirection::Playback,
+            config.system_capture_device.as_deref(),
+            &self.system_device_ids,
+        );
+        self.rebuild_device_combo(
+            &self.microphone_capture_device,
+            AudioDeviceDirection::Capture,
+            config.microphone_capture_device.as_deref(),
+            &self.microphone_device_ids,
+        );
+        self.rebuild_device_combo(
+            &self.playback_device,
+            AudioDeviceDirection::Playback,
+            config.playback_device.as_deref(),
+            &self.playback_device_ids,
+        );
+        self.update_audio_visibility();
+        self.applying_audio_state.set(false);
+    }
+
+    pub(super) fn set_audio_devices(&self, devices: Vec<AudioDevice>) {
+        self.applying_audio_state.set(true);
+        self.audio_devices.replace(devices);
+        let config = self.audio_config.borrow().clone();
+        self.rebuild_device_combo(
+            &self.system_capture_device,
+            AudioDeviceDirection::Playback,
+            config.system_capture_device.as_deref(),
+            &self.system_device_ids,
+        );
+        self.rebuild_device_combo(
+            &self.microphone_capture_device,
+            AudioDeviceDirection::Capture,
+            config.microphone_capture_device.as_deref(),
+            &self.microphone_device_ids,
+        );
+        self.rebuild_device_combo(
+            &self.playback_device,
+            AudioDeviceDirection::Playback,
+            config.playback_device.as_deref(),
+            &self.playback_device_ids,
+        );
+        self.applying_audio_state.set(false);
+    }
+
+    pub(super) fn set_audio_status(&self, status: AudioPeerStatus) {
+        let text = match status {
+            AudioPeerStatus::Off => "Desativado".to_owned(),
+            AudioPeerStatus::WaitingForPeer => "Aguardando o outro dispositivo".to_owned(),
+            AudioPeerStatus::Starting => "Iniciando".to_owned(),
+            AudioPeerStatus::Active => "Ativo".to_owned(),
+            AudioPeerStatus::DeviceUnavailable(error) => {
+                format!("Dispositivo indisponível: {error}")
+            }
+            AudioPeerStatus::Error(error) => format!("Erro: {error}"),
+        };
+        self.audio_status_row.set_subtitle(&text);
     }
 
     pub(super) fn set_hostname(&self, hostname: Option<String>) {

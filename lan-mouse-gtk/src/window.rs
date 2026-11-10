@@ -11,8 +11,8 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
-    Position,
+    AudioDevice, AudioPeerStatus, ClientConfig, ClientHandle, ClientState, DEFAULT_PORT,
+    FrontendRequest, FrontendRequestWriter, Position,
 };
 
 use crate::{
@@ -256,6 +256,22 @@ impl Window {
                             }
                         ),
                     );
+                    row.connect_closure(
+                        "request-audio-config",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::UpdateAudioConfig(
+                                        client.handle(),
+                                        row.audio_config(),
+                                    ));
+                                }
+                            }
+                        ),
+                    );
                     row.upcast()
                 }
             ),
@@ -362,6 +378,7 @@ impl Window {
         row.set_position(client.pos);
         row.set_keyboard_layout(client.keyboard_layout);
         self.sync_grid_editor_peers();
+        row.set_audio_config(client.audio);
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
@@ -405,6 +422,20 @@ impl Window {
         }
         row.refresh_version_status();
         self.sync_grid_editor_peers();
+    }
+
+    pub(super) fn update_audio_devices(&self, devices: Vec<AudioDevice>) {
+        for client in self.clients().iter::<ClientObject>().flatten() {
+            if let Some(row) = self.row_for_handle(client.handle()) {
+                row.set_audio_devices(devices.clone());
+            }
+        }
+    }
+
+    pub(super) fn update_audio_status(&self, handle: ClientHandle, status: AudioPeerStatus) {
+        if let Some(row) = self.row_for_handle(handle) {
+            row.set_audio_status(status);
+        }
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {

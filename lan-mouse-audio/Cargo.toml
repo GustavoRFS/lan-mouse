@@ -1,0 +1,25 @@
+[package]
+name = "lan-mouse-audio"
+description = "shared audio core for lan-mouse"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/feschber/lan-mouse"
+
+[dependencies]
+lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.5.0" }
+lan-mouse-proto = { path = "../lan-mouse-proto", version = "0.5.0" }
+opus = "0.4"
+thiserror = "2.0"
+tokio = { version = "1.32", features = ["sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+log = "0.4"
+pulse = { package = "libpulse-binding", version = "2.30" }
+pulse_simple = { package = "libpulse-simple-binding", version = "2.29" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+log = "0.4"
+wasapi = "0.26"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO"] }

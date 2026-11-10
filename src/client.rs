@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{AudioConfig, ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 
@@ -35,6 +35,7 @@ impl ClientManager {
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
             keyboard_layout: config_client.keyboard_layout,
+            audio: config_client.audio,
         };
         let state = ClientState {
             active: config_client.active,
@@ -56,6 +57,15 @@ impl ClientManager {
     pub fn set_config(&self, handle: ClientHandle, config: ClientConfig) {
         if let Some((c, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
             *c = config;
+        }
+    }
+
+    pub(crate) fn set_audio_config(&self, handle: ClientHandle, audio: AudioConfig) -> bool {
+        if let Some((config, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            config.audio = audio;
+            true
+        } else {
+            false
         }
     }
 
@@ -107,6 +117,19 @@ impl ClientManager {
                 }
             })
             .map(|p| p as ClientHandle)
+    }
+
+    /// Find the unique configured peer at this address, including inactive peers.
+    /// An ambiguous address is deliberately rejected so audio cannot be routed to
+    /// an arbitrary client when several configurations share one host.
+    pub(crate) fn get_audio_client_for_ip(&self, ip: IpAddr) -> Option<ClientHandle> {
+        let clients = self.clients.borrow();
+        let mut matches = clients
+            .iter()
+            .filter(|(_, (_, state))| state.ips.contains(&ip))
+            .map(|(handle, _)| handle as ClientHandle);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
     }
 
     /// get the client at the given position
@@ -389,5 +412,65 @@ mod tests {
         assert!(!clients.set_alive(handle, true));
         assert!(clients.set_alive(handle, false));
         assert!(!clients.set_alive(handle, false));
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::ClientManager;
+    use lan_mouse_ipc::{AudioConfig, AudioMode};
+    use std::{collections::HashSet, net::IpAddr};
+
+    #[test]
+    fn audio_config_update_changes_only_the_selected_client() {
+        let manager = ClientManager::default();
+        let first = manager.add_client();
+        let second = manager.add_client();
+        let config = AudioConfig {
+            mode: AudioMode::Send,
+            ..AudioConfig::default()
+        };
+
+        assert!(manager.set_audio_config(first, config.clone()));
+
+        let (first_config, _) = manager.get_state(first).unwrap();
+        let (second_config, _) = manager.get_state(second).unwrap();
+        assert_eq!(first_config.audio, config);
+        assert_eq!(second_config.audio, AudioConfig::default());
+        assert!(!manager.set_audio_config(u64::MAX, AudioConfig::default()));
+    }
+
+    #[test]
+    fn audio_peer_lookup_includes_inactive_clients() {
+        let manager = ClientManager::default();
+        let handle = manager.add_client();
+        let ip = "192.0.2.14".parse::<IpAddr>().unwrap();
+        manager.set_state(
+            handle,
+            lan_mouse_ipc::ClientState {
+                ips: HashSet::from([ip]),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(manager.get_audio_client_for_ip(ip), Some(handle));
+    }
+
+    #[test]
+    fn audio_peer_lookup_rejects_ambiguous_addresses() {
+        let manager = ClientManager::default();
+        let ip = "192.0.2.14".parse::<IpAddr>().unwrap();
+        for _ in 0..2 {
+            let handle = manager.add_client();
+            manager.set_state(
+                handle,
+                lan_mouse_ipc::ClientState {
+                    ips: HashSet::from([ip]),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(manager.get_audio_client_for_ip(ip), None);
     }
 }

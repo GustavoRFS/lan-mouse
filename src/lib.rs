@@ -1,3 +1,4 @@
+mod audio;
 mod capture;
 pub mod capture_test;
 pub mod client;

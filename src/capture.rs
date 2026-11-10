@@ -11,7 +11,7 @@ use input_capture::{
 use input_event::MonitorDescriptor;
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_ipc::MonitorGrid;
-use lan_mouse_proto::{ClipboardUpdateId, ProtoEvent};
+use lan_mouse_proto::{AudioMessage, ClipboardUpdateId, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,42 @@ pub(crate) struct Capture {
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
+    audio_event_rx: tokio::sync::mpsc::Receiver<ICaptureEvent>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AudioSender(Sender<CaptureRequest>);
+
+impl AudioSender {
+    pub(crate) fn send(&self, handle: u64, message: AudioMessage) {
+        self.0
+            .send(CaptureRequest::Audio { handle, message })
+            .expect("capture channel closed");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use super::*;
+
+    pub(crate) struct AudioChannel {
+        sender: AudioSender,
+        _receiver: Receiver<CaptureRequest>,
+    }
+
+    impl AudioChannel {
+        pub(crate) fn sender(&self) -> &AudioSender {
+            &self.sender
+        }
+    }
+
+    pub(crate) fn audio_channel() -> AudioChannel {
+        let (sender, receiver) = channel();
+        AudioChannel {
+            sender: AudioSender(sender),
+            _receiver: receiver,
+        }
+    }
 }
 
 pub(crate) enum ICaptureEvent {
@@ -57,11 +93,17 @@ pub(crate) enum ICaptureEvent {
         supports_monitor_grid: bool,
     },
     PeerConnected(CaptureHandle),
-    PeerDisconnected(CaptureHandle),
     PeerStatus(CaptureHandle, bool),
     PeerProtocol {
         handle: CaptureHandle,
         event: ProtoEvent,
+    },
+    Audio {
+        handle: u64,
+        message: AudioMessage,
+    },
+    PeerDisconnected {
+        handle: u64,
     },
 }
 
@@ -95,6 +137,10 @@ enum CaptureRequest {
     DiscoverMonitors(CaptureHandle),
     SendProto(CaptureHandle, ProtoEvent),
     SetMonitorGrid(Option<MonitorGrid>, String),
+    Audio {
+        handle: u64,
+        message: AudioMessage,
+    },
 }
 
 impl Capture {
@@ -105,6 +151,7 @@ impl Capture {
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (audio_event_tx, audio_event_rx) = tokio::sync::mpsc::channel(4);
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
@@ -114,6 +161,7 @@ impl Capture {
             conn,
             event_tx,
             request_rx,
+            audio_event_tx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
             monitor_grid: None,
@@ -127,6 +175,7 @@ impl Capture {
             request_tx,
             task,
             event_rx,
+            audio_event_rx,
         }
     }
 
@@ -226,7 +275,10 @@ impl Capture {
     }
 
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
-        self.event_rx.recv().await.expect("channel closed")
+        tokio::select! {
+            event = self.event_rx.recv() => event.expect("channel closed"),
+            event = self.audio_event_rx.recv() => event.expect("audio event channel closed"),
+        }
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
@@ -247,6 +299,10 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::CancelClipboardTransfers)
             .expect("channel closed");
+    }
+
+    pub(crate) fn audio_sender(&self) -> AudioSender {
+        AudioSender(self.request_tx.clone())
     }
 }
 
@@ -288,6 +344,7 @@ struct CaptureTask {
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
+    audio_event_tx: tokio::sync::mpsc::Sender<ICaptureEvent>,
     state: State,
     monitor_grid: Option<MonitorGrid>,
     local_fingerprint: String,
@@ -358,6 +415,11 @@ impl CaptureTask {
                             self.monitor_grid = grid;
                             self.local_fingerprint = fingerprint;
                         }
+                        CaptureRequest::Audio { handle, message } => {
+                            if let Err(error) = self.conn.send_audio(message, handle).await {
+                                log::debug!("audio send to client {handle} deferred: {error}");
+                            }
+                        }
                     },
                     (handle, event) = self.conn.recv() => {
                         match event {
@@ -368,16 +430,25 @@ impl CaptureTask {
                                 self.event_tx.send(ICaptureEvent::PeerConnected(handle)).expect("channel closed");
                             }
                             NetworkEvent::Disconnected => {
-                                self.event_tx.send(ICaptureEvent::PeerDisconnected(handle)).expect("channel closed");
+                                self.event_tx.send(ICaptureEvent::PeerDisconnected { handle }).expect("channel closed");
                             }
                             NetworkEvent::PeerStatus { changed } => {
                                 self.event_tx.send(ICaptureEvent::PeerStatus(handle, changed)).expect("channel closed");
                             }
                             NetworkEvent::Proto(event) => {
-                                self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed");
+                                if is_monitor_grid_protocol_event(&event) {
+                                    self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed");
+                                } else {
+                                    log::trace!("ignoring input network event from {handle} while input capture is unavailable");
+                                }
+                            }
+                            NetworkEvent::Audio(message) => {
+                                if let Err(error) = self.audio_event_tx.try_send(ICaptureEvent::Audio { handle, message }) {
+                                    log::debug!("dropping audio event from client {handle}: {error}");
+                                }
                             }
                         }
-                    }
+                    },
                     _ = self.cancellation_token.cancelled() => return,
                 }
             }
@@ -464,7 +535,10 @@ impl CaptureTask {
                             continue;
                         }
                         NetworkEvent::Disconnected => {
-                            self.event_tx.send(ICaptureEvent::PeerDisconnected(handle)).expect("channel closed");
+                            self.event_tx.send(ICaptureEvent::PeerDisconnected { handle }).expect("channel closed");
+                            if self.active_client == Some(handle) {
+                                self.release_capture(capture).await?;
+                            }
                             continue;
                         }
                         NetworkEvent::PeerStatus { changed } => {
@@ -475,6 +549,12 @@ impl CaptureTask {
                             if is_monitor_grid_protocol_event(&event) =>
                         {
                             self.event_tx.send(ICaptureEvent::PeerProtocol { handle, event }).expect("channel closed");
+                            continue;
+                        }
+                        NetworkEvent::Audio(message) => {
+                            if let Err(error) = self.audio_event_tx.try_send(ICaptureEvent::Audio { handle, message }) {
+                                log::debug!("dropping audio event from client {handle}: {error}");
+                            }
                             continue;
                         }
                         NetworkEvent::Proto(event) => event,
@@ -544,6 +624,11 @@ impl CaptureTask {
                     }
                     CaptureRequest::CancelClipboardTransfers => {
                         self.conn.cancel_clipboard_transfers().await;
+                    }
+                    CaptureRequest::Audio { handle, message } => {
+                        if let Err(error) = self.conn.send_audio(message, handle).await {
+                            log::debug!("audio send to client {handle} deferred: {error}");
+                        }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

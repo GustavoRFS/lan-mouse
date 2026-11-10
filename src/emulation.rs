@@ -5,7 +5,7 @@ use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::{Event, MonitorId};
 use lan_mouse_ipc::Position as IpcPosition;
-use lan_mouse_proto::{ClipboardUpdateId, KeyboardLayout, Position, ProtoEvent};
+use lan_mouse_proto::{AudioMessage, ClipboardUpdateId, KeyboardLayout, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -25,6 +25,7 @@ pub(crate) struct Emulation {
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
+    audio_event_rx: tokio::sync::mpsc::Receiver<EmulationEvent>,
 }
 
 pub(crate) enum EmulationEvent {
@@ -84,6 +85,11 @@ pub(crate) enum EmulationEvent {
         fingerprint: String,
         event: ProtoEvent,
     },
+    Audio {
+        addr: SocketAddr,
+        fingerprint: String,
+        message: AudioMessage,
+    },
 }
 
 enum EmulationRequest {
@@ -108,10 +114,12 @@ impl Emulation {
         let emulation_proxy = EmulationProxy::new(backend, options);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (audio_event_tx, audio_event_rx) = tokio::sync::mpsc::channel(4);
         let emulation_task = ListenTask {
             listener,
             emulation_proxy,
             request_rx,
+            audio_event_tx,
             event_tx,
         };
         let task = spawn_local(emulation_task.run());
@@ -119,6 +127,7 @@ impl Emulation {
             task,
             request_tx,
             event_rx,
+            audio_event_rx,
         }
     }
 
@@ -163,7 +172,10 @@ impl Emulation {
     }
 
     pub(crate) async fn event(&mut self) -> EmulationEvent {
-        self.event_rx.recv().await.expect("channel closed")
+        tokio::select! {
+            event = self.event_rx.recv() => event.expect("channel closed"),
+            event = self.audio_event_rx.recv() => event.expect("audio event channel closed"),
+        }
     }
 
     /// wait for termination
@@ -182,6 +194,7 @@ struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
+    audio_event_tx: tokio::sync::mpsc::Sender<EmulationEvent>,
     event_tx: Sender<EmulationEvent>,
 }
 
@@ -272,6 +285,17 @@ impl ListenTask {
                     }
                     Some(ListenEvent::Clipboard { update_id, payload, addr }) => {
                         self.event_tx.send(EmulationEvent::Clipboard { addr, update_id, payload }).expect("channel closed");
+                    }
+                    Some(ListenEvent::Audio { addr, fingerprint, message }) => {
+                        last_response.insert(addr, Instant::now());
+                        if let Err(error) = self.audio_event_tx.try_send(EmulationEvent::Audio { addr, fingerprint, message }) {
+                            log::debug!("dropping audio event from {addr}: {error}");
+                        }
+                    }
+                    Some(ListenEvent::Disconnected { addr }) => {
+                        last_response.remove(&addr);
+                        self.emulation_proxy.remove(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");

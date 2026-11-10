@@ -3,7 +3,7 @@
 ## Events
 
 Each instance of lan-mouse can emit and receive events, where
-an event is either a mouse or keyboard event for now.
+an event can be mouse, keyboard, clipboard, or audio data.
 
 The general Architecture is shown in the following flow chart:
 ```mermaid
@@ -26,6 +26,34 @@ Windows and Hyprland's layer-shell capture identify the physical output and the 
 Grid cells are equal logical units. The routing protocol does not scale or align pixel coordinates, so outputs with different resolutions can be arranged together. The GTK **Arrange monitors** window discovers a peer's outputs, allows its remote tiles to be moved, and saves the snapshot to the top-level `monitor_grid` TOML section. Grid snapshots are authenticated, versioned, acknowledged, retried, and replayed after reconnection. Missing or disconnected outputs stay in the layout but are excluded from active routes until rediscovered.
 
 Peers that do not advertise monitor-grid support keep using the legacy per-client `Position` setting and `Enter(Position)` event. Capture backends without named monitor edges also retain the directional behavior.
+
+### Audio sharing
+
+The audio path is separate from input-event emulation:
+
+```mermaid
+flowchart LR
+    C[WASAPI or Pulse capture] --> O[Opus 48 kHz / 20 ms]
+    O -->|authenticated DTLS audio datagrams| N[Peer session negotiation]
+    N --> D[Opus decoder and bounded playout queue]
+    D --> P[WASAPI or Pulse playback]
+    D --> V[Virtual microphone endpoint]
+```
+
+Each configured peer announces one role: `Off`, `Send`, or `Receive`. A peer
+starts capture or playback only for a complementary role announcement. System
+audio and microphone audio use separate Opus tracks and retain independent
+sequence numbers. Per-peer workers and queues are bounded, and disconnects or
+role changes stop their workers and clear pending frames. Audio media is
+accepted only from the authenticated connection associated with one unambiguous
+configured peer address.
+
+The shared Rust audio crate contains the Opus codec and playout logic. Linux
+uses PulseAudio APIs and creates a temporary Pulse-compatible virtual source
+for received microphone audio. Windows uses shared-mode WASAPI loopback,
+microphone capture, and playback. The user-mode bridge targets the IOCTL
+contract in `audio-driver/windows/lan_mouse_mic_ioctl.h`; the WDM/WaveRT driver
+that exposes the Windows recording endpoint remains to be implemented.
 
 ### Input
 The input component is responsible for translating inputs from a given backend

@@ -8,6 +8,7 @@ members = [
     "lan-mouse-gtk",
     "lan-mouse-proto",
     "lan-mouse-transfer",
+    "lan-mouse-audio",
 ]
 
 [package]
@@ -32,6 +33,7 @@ input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
+lan-mouse-audio = { path = "lan-mouse-audio", version = "0.1.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.5.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.5.0" }

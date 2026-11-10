@@ -3,7 +3,7 @@ mod imp;
 use adw::subclass::prelude::*;
 use gtk::glib::{self, Object};
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState};
+use lan_mouse_ipc::{AudioConfig, ClientConfig, ClientHandle, ClientState};
 
 glib::wrapper! {
     pub struct ClientObject(ObjectSubclass<imp::ClientObject>);
@@ -11,7 +11,7 @@ glib::wrapper! {
 
 impl ClientObject {
     pub fn new(handle: ClientHandle, client: ClientConfig, state: ClientState) -> Self {
-        Object::builder()
+        let object: Self = Object::builder()
             .property("handle", handle)
             .property("hostname", client.hostname)
             .property("port", client.port as u32)
@@ -36,7 +36,9 @@ impl ClientObject {
                 "monitor-grid-version",
                 state.monitor_grid_version.map_or(0, u32::from),
             )
-            .build()
+            .build();
+        object.imp().data.borrow_mut().audio = client.audio;
+        object
     }
 
     pub fn get_data(&self) -> ClientData {
@@ -65,4 +67,5 @@ pub struct ClientData {
     pub peer_fingerprint: Option<String>,
     pub monitor_grid_version: u32,
     pub keyboard_layout: String,
+    pub audio: AudioConfig,
 }

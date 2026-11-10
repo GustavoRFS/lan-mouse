@@ -1,5 +1,6 @@
 use crate::{
-    capture::{Capture, CaptureType, ICaptureEvent},
+    audio::AudioRuntime,
+    capture::{AudioSender, Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     clipboard::{ClipboardPayload, SharedClipboardReassembler},
     config::{Config, ConfigClient},
@@ -19,12 +20,13 @@ use futures::StreamExt;
 use input_capture::CapturePoint;
 use input_event::{MonitorDescriptor, MonitorId};
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, MonitorGrid, Position, RemoteFileOffer, Status,
+    AsyncFrontendListener, AudioMode, AudioPeerStatus, ClientHandle, FrontendEvent,
+    FrontendRequest, IpcError, IpcListenerCreationError, MonitorGrid, Position, RemoteFileOffer,
+    Status,
 };
 use lan_mouse_proto::{
-    ClipboardReassembler, ClipboardUpdateId, FileOfferAnnouncement, MAX_CLIPBOARD_IMAGE_BYTES,
-    MAX_CLIPBOARD_TEXT_BYTES,
+    AudioMessage, ClipboardReassembler, ClipboardUpdateId, FileOfferAnnouncement,
+    MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
 };
 use log;
 use std::{
@@ -54,6 +56,8 @@ pub struct Service {
     config: Config,
     /// input capture
     capture: Capture,
+    audio: AudioRuntime,
+    audio_sender: AudioSender,
     /// input emulation
     emulation: Emulation,
     /// dns resolver
@@ -88,6 +92,7 @@ pub struct Service {
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
+    incoming_audio_peers: HashMap<SocketAddr, ClientHandle>,
     next_trigger_handle: u64,
     monitor_grid: Option<MonitorGrid>,
     local_monitor_catalog: Vec<MonitorDescriptor>,
@@ -156,6 +161,14 @@ impl Service {
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
         capture.set_monitor_grid(monitor_grid.clone(), public_key_fingerprint.clone());
+        let audio_sender = capture.audio_sender();
+        let mut audio = AudioRuntime::new();
+        for (handle, client, _) in client_manager.get_client_states() {
+            audio.register_peer(handle, client.audio.clone());
+            if client.audio.mode != AudioMode::Off {
+                audio.announce_peer(handle, client.audio, &audio_sender);
+            }
+        }
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, config.emulation_options(), listener);
 
@@ -166,6 +179,8 @@ impl Service {
         let service = Self {
             config,
             capture,
+            audio,
+            audio_sender,
             emulation,
             frontend_listener,
             resolver,
@@ -178,6 +193,7 @@ impl Service {
             capture_status: Default::default(),
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
+            incoming_audio_peers: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             clipboard_sharing,
@@ -200,6 +216,11 @@ impl Service {
             incoming_fingerprints: HashMap::new(),
             peer_capabilities: HashMap::new(),
         };
+        for (handle, client, _) in service.client_manager.get_client_states() {
+            if client.audio.mode != AudioMode::Off {
+                service.resolve(handle);
+            }
+        }
         Ok(service)
     }
 
@@ -302,6 +323,25 @@ impl Service {
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
                 self.update_leave_hook(handle, leave_hook)
             }
+            FrontendRequest::UpdateAudioConfig(handle, audio_config) => {
+                if self
+                    .client_manager
+                    .set_audio_config(handle, audio_config.clone())
+                {
+                    let status =
+                        self.audio
+                            .configure_peer(handle, audio_config, &self.audio_sender);
+                    self.notify_audio_status(handle, status);
+                    self.broadcast_client(handle);
+                    self.save_config();
+                }
+            }
+            FrontendRequest::EnumerateAudioDevices => match self.audio.enumerate_devices() {
+                Ok(devices) => self.notify_frontend(FrontendEvent::AudioDevices(devices)),
+                Err(error) => self.notify_frontend(FrontendEvent::Error(format!(
+                    "Audio device enumeration failed: {error}"
+                ))),
+            },
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::SetClipboardSharing(enabled) => {
                 if self.clipboard_sharing != enabled {
@@ -1011,6 +1051,7 @@ impl Service {
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
                 keyboard_layout: c.keyboard_layout,
+                audio: c.audio,
             })
             .collect();
         self.config.set_clients(clients);
@@ -1033,6 +1074,14 @@ impl Service {
         }
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
+            if let Some((client, _)) = self.client_manager.get_state(handle) {
+                self.audio.register_peer(handle, client.audio.clone());
+                if client.audio.mode != AudioMode::Off {
+                    self.audio
+                        .announce_peer(handle, client.audio, &self.audio_sender);
+                    self.resolve(handle);
+                }
+            }
             log::info!("added client {handle}");
             let (c, s) = self.client_manager.get_state(handle).unwrap();
             if s.active {
@@ -1127,6 +1176,9 @@ impl Service {
                 }
                 self.incoming_grid_senders.remove(&addr);
                 self.incoming_catalog_senders.remove(&addr);
+                if let Some(handle) = self.incoming_audio_peers.remove(&addr) {
+                    self.disconnect_audio_if_idle(handle);
+                }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -1152,6 +1204,17 @@ impl Service {
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.incoming_fingerprints.insert(addr, fingerprint.clone());
                 self.send_local_grid_capability_to_addr(addr);
+                if self.is_authorized_fingerprint(&fingerprint) {
+                    if let Some(handle) = self.client_manager.get_audio_client_for_ip(addr.ip()) {
+                        self.incoming_audio_peers.insert(addr, handle);
+                        if let Some((client, _)) = self.client_manager.get_state(handle) {
+                            if client.audio.mode != AudioMode::Off {
+                                self.audio
+                                    .announce_peer(handle, client.audio, &self.audio_sender);
+                            }
+                        }
+                    }
+                }
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -1178,6 +1241,13 @@ impl Service {
                 fingerprint,
                 event,
             } => self.handle_incoming_peer_protocol(addr, fingerprint, event),
+            EmulationEvent::Audio {
+                addr,
+                fingerprint,
+                message,
+            } => {
+                self.handle_incoming_audio(addr, &fingerprint, message);
+            }
         }
     }
 
@@ -1234,12 +1304,13 @@ impl Service {
                 }
                 self.send_local_grid_capability_to_client(handle);
             }
-            ICaptureEvent::PeerDisconnected(handle) => {
+            ICaptureEvent::PeerDisconnected { handle } => {
                 self.grid_senders.remove(&handle);
                 self.catalog_senders.remove(&handle);
                 self.clear_disconnected_remote_catalog(handle);
                 self.rebuild_active_client_captures();
                 self.broadcast_client(handle);
+                self.disconnect_audio_if_idle(handle);
             }
             ICaptureEvent::PeerStatus(handle, changed) => {
                 if changed {
@@ -1249,6 +1320,9 @@ impl Service {
             }
             ICaptureEvent::PeerProtocol { handle, event } => {
                 self.handle_peer_protocol(handle, event);
+            }
+            ICaptureEvent::Audio { handle, message } => {
+                self.handle_outgoing_audio(handle, message);
             }
         }
     }
@@ -1351,6 +1425,69 @@ impl Service {
             });
         }
     }
+    fn handle_outgoing_audio(&mut self, handle: ClientHandle, message: AudioMessage) {
+        let Some((client, _)) = self.client_manager.get_state(handle) else {
+            log::debug!("ignoring audio from removed peer {handle}");
+            return;
+        };
+        let previous = self.audio.status(handle);
+        let status = self
+            .audio
+            .observe_message(handle, client.audio, message, &self.audio_sender);
+        if previous.as_ref() != Some(&status) {
+            self.notify_audio_status(handle, status);
+        }
+    }
+
+    fn handle_incoming_audio(
+        &mut self,
+        addr: SocketAddr,
+        fingerprint: &str,
+        message: AudioMessage,
+    ) {
+        if !self.is_authorized_fingerprint(fingerprint) {
+            log::warn!("dropping audio from unauthenticated DTLS peer {addr}");
+            return;
+        }
+        let Some(handle) = self.client_manager.get_audio_client_for_ip(addr.ip()) else {
+            log::debug!("ignoring audio from unconfigured or ambiguous peer {addr}");
+            return;
+        };
+        self.incoming_audio_peers.insert(addr, handle);
+        let Some((client, _)) = self.client_manager.get_state(handle) else {
+            return;
+        };
+        let previous = self.audio.status(handle);
+        let status = self
+            .audio
+            .observe_message(handle, client.audio, message, &self.audio_sender);
+        if previous.as_ref() != Some(&status) {
+            self.notify_audio_status(handle, status);
+        }
+    }
+
+    fn is_authorized_fingerprint(&self, fingerprint: &str) -> bool {
+        self.authorized_keys
+            .read()
+            .expect("lock")
+            .contains_key(fingerprint)
+    }
+
+    fn notify_audio_status(&mut self, handle: ClientHandle, status: AudioPeerStatus) {
+        self.notify_frontend(FrontendEvent::AudioPeerStatus { handle, status });
+    }
+
+    fn disconnect_audio_if_idle(&mut self, handle: ClientHandle) {
+        let incoming_connection_remains = self
+            .incoming_audio_peers
+            .values()
+            .any(|connected_handle| *connected_handle == handle);
+        if incoming_connection_remains || self.client_manager.active_addr(handle).is_some() {
+            return;
+        }
+        let status = self.audio.disconnect(handle);
+        self.notify_audio_status(handle, status);
+    }
 
     fn handle_resolver_event(&mut self, event: DnsEvent) {
         let handle = match event {
@@ -1365,6 +1502,12 @@ impl Service {
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);
+                if let Some((client, _)) = self.client_manager.get_state(handle) {
+                    if client.audio.mode != AudioMode::Off {
+                        self.audio
+                            .announce_peer(handle, client.audio, &self.audio_sender);
+                    }
+                }
                 handle
             }
         };
@@ -1378,7 +1521,22 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
-        self.enumerate();
+        let clients = self.client_manager.get_client_states();
+        self.notify_frontend(FrontendEvent::Enumerate(clients.clone()));
+        for (handle, client, _) in clients {
+            let status = self.audio.status(handle).unwrap_or_else(|| {
+                if client.audio.mode == AudioMode::Off {
+                    AudioPeerStatus::Off
+                } else {
+                    AudioPeerStatus::WaitingForPeer
+                }
+            });
+            self.notify_audio_status(handle, status);
+        }
+        match self.audio.enumerate_devices() {
+            Ok(devices) => self.notify_frontend(FrontendEvent::AudioDevices(devices)),
+            Err(error) => log::debug!("audio devices unavailable: {error}"),
+        }
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
         self.notify_frontend(FrontendEvent::ClipboardSharing(self.clipboard_sharing));
@@ -1687,6 +1845,9 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        self.audio.remove_peer(handle);
+        self.incoming_audio_peers
+            .retain(|_, connected_handle| *connected_handle != handle);
         if self
             .client_manager
             .remove_client(handle)

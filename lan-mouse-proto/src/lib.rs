@@ -18,6 +18,11 @@ use thiserror::Error;
 pub const MAX_EVENT_SIZE: usize = 1200;
 pub const MAX_MONITOR_CATALOG_CHUNK_ITEMS: usize = 5;
 pub const MAX_MONITOR_GRID_CHUNK_PAYLOAD: usize = 1024;
+mod audio;
+pub use audio::{
+    AudioControl, AudioData, AudioMessage, AudioRole, AudioTrack, MAX_AUDIO_DATAGRAM_SIZE,
+    decode_audio_message, encode_audio_message, is_audio_message,
+};
 
 /// Maximum size of a clipboard frame carried as one DTLS application datagram.
 pub const MAX_CLIPBOARD_FRAME_SIZE: usize = 1200;
@@ -71,6 +76,9 @@ pub enum ProtocolError {
     /// Clipboard receiver exceeded its bounded reassembly budget.
     #[error("clipboard reassembly budget exceeded")]
     ClipboardReassemblyLimit,
+    /// Audio media frame is malformed, oversized, or uses an unsupported version.
+    #[error("invalid audio frame")]
+    InvalidAudioFrame,
     /// Reassembled clipboard data is not UTF-8 text.
     #[error("clipboard text is not valid UTF-8")]
     ClipboardInvalidUtf8,
@@ -1860,5 +1868,110 @@ mod monitor_grid_protocol_tests {
         oversized_id.extend(std::iter::repeat_n(b'x', 97));
         oversized_id.push(Position::Left as u8);
         assert!(ProtoEvent::decode(&oversized_id).is_err());
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    #[test]
+    fn audio_control_round_trips() {
+        let message = AudioMessage::Control(AudioControl {
+            role: AudioRole::Receive,
+            send_system_audio: true,
+            send_microphone: true,
+            receive_microphone: false,
+        });
+
+        let encoded = encode_audio_message(&message).unwrap();
+
+        assert_eq!(decode_audio_message(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn audio_data_round_trips() {
+        let message = AudioMessage::Data(AudioData {
+            track: AudioTrack::Microphone,
+            sequence: 0x0102_0304,
+            timestamp_48khz: 0x0102_0304_0506_0708,
+            opus: vec![0, 1, 2, 0xfe, 0xff],
+        });
+
+        let encoded = encode_audio_message(&message).unwrap();
+
+        assert_eq!(decode_audio_message(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn audio_decoder_rejects_oversize_and_accepts_the_boundary() {
+        let max_message = AudioMessage::Data(AudioData {
+            track: AudioTrack::System,
+            sequence: 1,
+            timestamp_48khz: 48_000,
+            opus: vec![0x55; MAX_AUDIO_DATAGRAM_SIZE - 21],
+        });
+        let encoded = encode_audio_message(&max_message).unwrap();
+        assert_eq!(encoded.len(), MAX_AUDIO_DATAGRAM_SIZE);
+        assert_eq!(decode_audio_message(&encoded).unwrap(), max_message);
+
+        let mut oversized = encoded;
+        oversized.push(0);
+        assert!(decode_audio_message(&oversized).is_err());
+        assert!(
+            encode_audio_message(&AudioMessage::Data(AudioData {
+                track: AudioTrack::System,
+                sequence: 2,
+                timestamp_48khz: 96_000,
+                opus: vec![0x55; MAX_AUDIO_DATAGRAM_SIZE - 20],
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn audio_decoder_rejects_unknown_version_or_track() {
+        let message = AudioMessage::Data(AudioData {
+            track: AudioTrack::System,
+            sequence: 3,
+            timestamp_48khz: 144_000,
+            opus: vec![1, 2, 3],
+        });
+        let encoded = encode_audio_message(&message).unwrap();
+
+        let mut unknown_version = encoded.clone();
+        unknown_version[4] = 2;
+        assert!(is_audio_message(&unknown_version));
+        assert!(decode_audio_message(&unknown_version).is_err());
+
+        let mut unknown_track = encoded;
+        unknown_track[6] = 0xff;
+        assert!(decode_audio_message(&unknown_track).is_err());
+    }
+
+    #[test]
+    fn audio_classification_keeps_input_and_clipboard_frames_separate() {
+        let input = ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+            time: 42,
+            dx: 1.5,
+            dy: -2.0,
+        }));
+        let (event, event_len): ([u8; MAX_EVENT_SIZE], usize) = input.into();
+        assert!(!is_audio_message(&event[..event_len]));
+        assert!(matches!(
+            ProtoEvent::try_from(event),
+            Ok(ProtoEvent::Input(_))
+        ));
+
+        let clipboard = chunk_text([0x42; 16], "audio")
+            .unwrap()
+            .remove(0)
+            .encode()
+            .unwrap();
+        assert!(!is_audio_message(&clipboard));
+        assert!(matches!(
+            ClipboardFrame::decode(&clipboard).unwrap(),
+            ClipboardFrame::TextChunk { .. }
+        ));
     }
 }
