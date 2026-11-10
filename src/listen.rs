@@ -312,29 +312,45 @@ impl Stream for LanMouseListener {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
-        let audio_event = match this.audio_rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some((addr, fingerprint, message))) => {
-                Some(ListenEvent::Audio {
-                    addr,
-                    fingerprint,
-                    message,
-                })
-            }
-            std::task::Poll::Ready(None) | std::task::Poll::Pending => None,
+        let audio_first = this.prefer_audio;
+        this.prefer_audio = !audio_first;
+        let first = if audio_first {
+            poll_audio(&mut this.audio_rx, cx)
+        } else {
+            this.listen_rx.poll_next_unpin(cx)
         };
-        let listen_event = this.listen_rx.poll_next_unpin(cx);
-        let result = match (this.prefer_audio, audio_event, listen_event) {
-            (true, Some(event), _) => std::task::Poll::Ready(Some(event)),
-            (false, _, std::task::Poll::Ready(Some(event))) => std::task::Poll::Ready(Some(event)),
-            (_, Some(event), std::task::Poll::Ready(None) | std::task::Poll::Pending) => {
-                std::task::Poll::Ready(Some(event))
-            }
-            (_, None, std::task::Poll::Ready(Some(event))) => std::task::Poll::Ready(Some(event)),
-            (_, None, std::task::Poll::Ready(None)) => std::task::Poll::Ready(None),
-            (_, None, std::task::Poll::Pending) => std::task::Poll::Pending,
+        let first_closed = matches!(&first, std::task::Poll::Ready(None));
+        if let std::task::Poll::Ready(Some(event)) = first {
+            return std::task::Poll::Ready(Some(event));
+        }
+
+        let second = if audio_first {
+            this.listen_rx.poll_next_unpin(cx)
+        } else {
+            poll_audio(&mut this.audio_rx, cx)
         };
-        this.prefer_audio = !this.prefer_audio;
-        result
+        match second {
+            std::task::Poll::Ready(Some(event)) => std::task::Poll::Ready(Some(event)),
+            std::task::Poll::Ready(None) if first_closed => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(None) | std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+fn poll_audio(
+    audio_rx: &mut tokio::sync::mpsc::Receiver<(SocketAddr, String, AudioMessage)>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Option<ListenEvent>> {
+    match audio_rx.poll_recv(cx) {
+        std::task::Poll::Ready(Some((addr, fingerprint, message))) => {
+            std::task::Poll::Ready(Some(ListenEvent::Audio {
+                addr,
+                fingerprint,
+                message,
+            }))
+        }
+        std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+        std::task::Poll::Pending => std::task::Poll::Pending,
     }
 }
 
@@ -416,4 +432,77 @@ async fn read_loop(
         .send(ListenEvent::Disconnected { addr })
         .expect("channel closed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker;
+    use lan_mouse_proto::{AudioControl, AudioRole};
+    use std::task::{Context, Poll};
+
+    #[tokio::test]
+    async fn listener_delivers_audio_and_input_when_both_are_ready() {
+        let (listen_tx, listen_rx) = channel();
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(4);
+        let (request_port_change, _request_rx) = channel();
+        let (_port_changed_tx, port_changed) = channel();
+        let addr = "127.0.0.1:4242".parse().unwrap();
+        let message = AudioMessage::Control(AudioControl {
+            role: AudioRole::Off,
+            send_system_audio: false,
+            send_microphone: false,
+            receive_microphone: false,
+        });
+
+        assert!(
+            listen_tx
+                .send(ListenEvent::Msg {
+                    event: ProtoEvent::Ping,
+                    addr,
+                })
+                .is_ok()
+        );
+        assert!(
+            audio_tx
+                .try_send((addr, "peer-fingerprint".into(), message))
+                .is_ok()
+        );
+
+        let listener = LanMouseListener {
+            listen_rx,
+            listen_tx,
+            audio_rx,
+            prefer_audio: true,
+            listen_task: tokio::spawn(async {}),
+            conns: Rc::new(AsyncMutex::new(Vec::new())),
+            request_port_change,
+            port_changed,
+        };
+        let mut listener = Box::pin(listener);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let first = listener.as_mut().poll_next(&mut cx);
+        let second = listener.as_mut().poll_next(&mut cx);
+
+        let mut received_audio = false;
+        let mut received_input = false;
+        for event in [first, second] {
+            match event {
+                Poll::Ready(Some(ListenEvent::Audio { .. })) => received_audio = true,
+                Poll::Ready(Some(ListenEvent::Msg {
+                    event: ProtoEvent::Ping,
+                    ..
+                })) => received_input = true,
+                _ => {}
+            }
+        }
+
+        assert!(received_audio, "the queued audio event must be delivered");
+        assert!(
+            received_input,
+            "the queued input event must not be discarded"
+        );
+    }
 }
