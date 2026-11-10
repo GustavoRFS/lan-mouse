@@ -130,11 +130,14 @@ impl AudioRuntime {
         match message {
             AudioMessage::Control(control) => {
                 let peer = self.peers.get_mut(&handle).expect("peer was inserted");
-                peer.stop_streams();
-                peer.session.set_local_config(config.clone());
-                peer.config = config;
-                peer.session.observe_remote(control);
-                self.reconcile(handle, transport);
+                let local_changed = peer.config != config;
+                let remote_changed = peer.session.observe_remote(control);
+                if local_changed || remote_changed {
+                    peer.stop_streams();
+                    peer.session.set_local_config(config.clone());
+                    peer.config = config;
+                    self.reconcile(handle, transport);
+                }
             }
             AudioMessage::Data(data) => self.receive_data(handle, data),
         }
@@ -344,7 +347,6 @@ mod tests {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn capture_source(
     track: AudioTrack,
     config: &AudioConfig,
@@ -364,7 +366,6 @@ fn capture_source(
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn playback_target(
     track: AudioTrack,
     handle: ClientHandle,
@@ -381,7 +382,6 @@ fn playback_target(
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn select_device(
     preferred: Option<&str>,
     direction: AudioDeviceDirection,

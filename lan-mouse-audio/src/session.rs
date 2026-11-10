@@ -26,8 +26,12 @@ impl AudioSessionState {
         self.local = local;
     }
 
-    pub fn observe_remote(&mut self, remote: AudioControl) {
+    pub fn observe_remote(&mut self, remote: AudioControl) -> bool {
+        if self.remote.as_ref() == Some(&remote) {
+            return false;
+        }
         self.remote = Some(remote);
+        true
     }
 
     pub fn disconnect(&mut self) {
@@ -142,6 +146,30 @@ mod tests {
             sender.negotiation().status,
             Some(AudioPeerStatus::WaitingForPeer)
         );
+    }
+
+    #[test]
+    fn observing_the_same_remote_control_is_idempotent() {
+        let mut local = config(AudioMode::Send);
+        local.send_microphone = true;
+        let mut session = AudioSessionState::new(local);
+        let remote = AudioControl {
+            receive_microphone: true,
+            ..control(AudioRole::Receive)
+        };
+
+        assert!(session.observe_remote(remote.clone()));
+        assert!(!session.observe_remote(remote));
+        assert_eq!(
+            session.negotiation().send_tracks,
+            [AudioTrack::System, AudioTrack::Microphone]
+        );
+
+        assert!(session.observe_remote(AudioControl {
+            receive_microphone: false,
+            ..control(AudioRole::Receive)
+        }));
+        assert_eq!(session.negotiation().send_tracks, [AudioTrack::System]);
     }
 
     #[test]
