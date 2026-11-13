@@ -506,6 +506,22 @@ mod tests {
     use super::*;
     use input_event::MonitorId;
 
+    #[cfg(windows)]
+    #[test]
+    fn monitor_grid_builder_loads_the_window_resource() {
+        gtk::init().expect("GTK should initialize for the resource test");
+        let builder = gtk::Builder::new();
+        builder
+            .add_from_string(include_str!("../resources/monitor_grid_window.ui"))
+            .expect("monitor grid window resource should load");
+
+        assert!(
+            builder
+                .object::<adw::Window>("monitor_grid_window")
+                .is_some()
+        );
+    }
+
     fn entry(owner: &str, id: &str, x: i32, y: i32) -> MonitorGridEntry {
         MonitorGridEntry {
             owner_fingerprint: owner.to_owned(),
