@@ -186,6 +186,7 @@ impl InputCapture {
             .id_map
             .remove(&id)
             .expect("no capture points for this handle");
+        self.pending.retain(|(handle, _, _)| *handle != id);
 
         let mut first_error = None;
         for point in points {

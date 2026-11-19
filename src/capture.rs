@@ -372,12 +372,11 @@ impl CaptureTask {
             .any(|(_, points, t)| points.contains(point) && *t == CaptureType::Default)
     }
 
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
+    fn get_type(&self, handle: CaptureHandle) -> Option<CaptureType> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|(_, _, capture_type)| *capture_type)
     }
 
     async fn run(mut self) {
@@ -650,6 +649,14 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        let Some(capture_type) = self.get_type(handle) else {
+            log::debug!("ignoring event for removed capture {handle}");
+            if self.active_client == Some(handle) {
+                self.release_capture(capture).await?;
+            }
+            return Ok(());
+        };
+
         if event == CaptureEvent::Begin {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
@@ -657,7 +664,7 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
             if !self.is_default_capture_at(&point) {
